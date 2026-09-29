@@ -1,0 +1,14 @@
+# Append to ~/.flwr/config.toml (Flower >= 1.36 keeps connections there).
+# One virtual SuperNode per client folder under `clients-root`.
+# num-gpus = 1.0 runs one client at a time per GPU (each loads the 2B DiT, ~5 GB bf16).
+
+[superlink.fedlora-sim]
+address = ":local:"
+options.num-supernodes = 2
+options.backend.client-resources.num-cpus = 4
+options.backend.client-resources.num-gpus = 1.0
+
+# Deployment: point `flwr run . fedlora-prod` at the operator's SuperLink Control API.
+[superlink.fedlora-prod]
+address = "fl.example.org:9093"
+root-certificates = "certificates/ca.crt"

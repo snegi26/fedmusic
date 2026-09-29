@@ -1,0 +1,115 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fedlora-music"
+version = "0.1.0"
+description = "Federated, privacy-preserving LoRA personalization of ACE-Step 1.5 music generation with Flower"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11,<3.13"
+# torch, transformers and ace-step are intentionally NOT listed: ACE-Step pins
+# platform-specific torch wheels via its own uv index config, so install this
+# package into ACE-Step's environment (see README).
+dependencies = [
+    "flwr[simulation]>=1.36.0",
+    "peft>=0.18.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+ui = ["toga>=0.5"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+fedlora-prepare = "fedlora_music.prepare:main"
+fedlora-generate = "fedlora_music.generate:main"
+fedlora-identity = "fedlora_music.identity:main"
+
+[project.gui-scripts]
+fedlora-ui = "fedlora_music_ui.app:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fedlora_music", "fedlora_music_ui"]
+
+# --------------------------------------------------------------------------
+# Desktop app (Briefcase). The bundle is the thin UI only; training/generation
+# run in the ACE-Step environment chosen in the app's settings.
+# --------------------------------------------------------------------------
+[tool.briefcase]
+project_name = "FedLoRA Music"
+bundle = "com.fedlora"
+version = "0.1.0"
+author = "Satish"
+
+[tool.briefcase.app.fedlora-music-ui]
+formal_name = "FedLoRA Music"
+description = "Learn your music style privately and generate in it"
+sources = ["fedlora_music_ui"]
+requires = []
+
+[tool.briefcase.app.fedlora-music-ui.macOS]
+requires = ["toga-cocoa>=0.5", "std-nslog~=1.0"]
+universal_build = false  # Apple Silicon only (MPS)
+
+[tool.briefcase.app.fedlora-music-ui.linux]
+requires = ["toga-gtk>=0.5"]
+
+# --------------------------------------------------------------------------
+# Flower app
+# --------------------------------------------------------------------------
+[tool.flwr.app]
+publisher = "fedlora"
+fab-format-version = 1
+flwr-version-target = "1.39.0"
+
+[tool.flwr.app.components]
+serverapp = "fedlora_music.server_app:app"
+clientapp = "fedlora_music.client_app:app"
+
+[tool.flwr.app.config]
+# Paths --------------------------------------------------------------------
+ace-project-root = "../ACE-Step-1.5"      # must contain ./checkpoints
+model-variant = "acestep-v15-turbo"       # checkpoint subdir / handler config_path
+clients-root = "./clients"                # each client reads ONLY <root>/client-<partition-id>
+server-output-dir = "./server_out"
+# Federation ---------------------------------------------------------------
+num-server-rounds = 10
+fraction-train = 1.0
+min-train-nodes = 2
+min-available-nodes = 2
+seed = 1234
+# Adapters -----------------------------------------------------------------
+target-modules = "q_proj,k_proj,v_proj,o_proj"
+global-rank = 16
+global-alpha = 16
+personal-rank = 8
+personal-alpha = 8
+lora-dropout = 0.0
+freeze-global-a = true                    # FFA-LoRA: exact FedAvg + half the DP noise dims
+# Local training -----------------------------------------------------------
+local-steps = 50
+batch-size = 1
+lr-global = 1e-4
+lr-personal = 2e-4
+grad-clip = 1.0
+cfg-ratio = 0.15
+# Differential privacy (client-level, enforced on the client) --------------
+dp-clip-norm = 0.05
+dp-noise-multiplier = 4.0
+dp-delta = 1e-5
+dp-epsilon-budget = 20.0
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"fedlora_music_ui/*" = ["RUF001"]  # ε and σ are intentional UI text
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
