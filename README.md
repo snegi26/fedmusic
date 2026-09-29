@@ -29,15 +29,70 @@ Design choices:
 
 ## Setup
 
-ACE-Step pins platform-specific torch wheels, so install into its environment:
+fedlora-music runs inside ACE-Step 1.5's Python environment. ACE-Step pins
+platform-specific torch wheels (CUDA on Linux/Windows, MPS on Apple Silicon), so this
+package does not list torch and is installed into ACE-Step's virtualenv instead.
+
+### Requirements
+
+- Python 3.11 or 3.12 (ACE-Step requires `>=3.11,<3.13`)
+- [uv](https://docs.astral.sh/uv/) and git
+- A CUDA GPU (recommended) or an Apple Silicon Mac with 16 GB+ unified memory (32 GB is comfortable for training). CPU works for generation but is too slow for training.
+- Disk space for the checkpoints (several GB)
+
+### 1. Install ACE-Step 1.5
+
+Clone it **next to** this repository, so the default `ace-project-root = "../ACE-Step-1.5"` works:
 
 ```bash
-git clone https://github.com/ace-step/ACE-Step-1.5.git
-cd ACE-Step-1.5 && uv sync && uv run acestep-download   # fetches checkpoints/
-uv pip install -e ../fedlora-music
+curl -LsSf https://astral.sh/uv/install.sh | sh     # installs uv (macOS / Linux)
+
+cd ..                                                # the folder that holds fedlora-music/
+git clone https://github.com/ACE-Step/ACE-Step-1.5.git
+cd ACE-Step-1.5
+uv sync                                              # creates .venv with the right torch build
 ```
 
-Point `ace-project-root` in `pyproject.toml` at the ACE-Step checkout.
+### 2. Download the checkpoints
+
+```bash
+uv run acestep-download          # main model into ./checkpoints
+uv run acestep-download --list   # optional: see the other variants
+```
+
+The main model includes the `acestep-v15-turbo` DiT (the default `model-variant`), the VAE,
+the Qwen3 text encoder and the 1.7B planner LM. Check that the files are where
+fedlora-music looks for them:
+
+```bash
+ls checkpoints/acestep-v15-turbo/config.json checkpoints/vae
+```
+
+fedlora-music always reads `<ace-project-root>/checkpoints`. If you set
+`ACESTEP_CHECKPOINTS_DIR` to share checkpoints between installs, symlink that folder to
+`ACE-Step-1.5/checkpoints`. To use another DiT variant, download it
+(`uv run acestep-download --model acestep-v15-sft`) and set `model-variant` to its folder name.
+
+Optional smoke test of ACE-Step on its own: `uv run acestep` opens its Gradio UI at
+http://localhost:7860.
+
+### 3. Install fedlora-music into ACE-Step's environment
+
+```bash
+# still in ACE-Step-1.5/
+uv pip install -e "../fedlora-music[dev]"          # add ,ui for the desktop app
+source .venv/bin/activate                          # use ACE-Step's env from now on
+python -c "import acestep, fedlora_music; print('ok')"
+cd ../fedlora-music
+```
+
+Run all `fedlora-*` and `flwr` commands below with this environment active.
+
+### 4. Point the app at ACE-Step
+
+If ACE-Step is not at `../ACE-Step-1.5`, set `ace-project-root` in `pyproject.toml`
+(simulation) or in each client's `node_config.toml` (deployment). An absolute path is
+the safest choice.
 
 ## Run in simulation (one machine)
 
@@ -143,8 +198,91 @@ Local DP with only a handful of clients adds a lot of noise to the global adapte
 - The server loads the base model once on CPU (fp32, about 8 GB RAM for the 2B DiT) only to derive adapter shapes and the shared `A`.
 - Secure aggregation isn't included. Adding it would permit distributed noise (σ/√n per client) for the same central guarantee.
 
+## Evaluating quality
+
+Each client can check, on its own machine, whether its adapters actually help. Keep a
+few songs out of training and prepare them as a held-out split:
+
+```bash
+fedlora-prepare --audio-dir ~/songs/alice-heldout --split eval \
+    --client-dir clients/client-0 --ace-project-root ../ACE-Step-1.5
+```
+
+After at least one federated round:
+
+```bash
+fedlora-eval --client-dir clients/client-0 --ace-project-root ../ACE-Step-1.5
+fedlora-eval ... --prompts my_prompts.txt --samples-per-prompt 4 --aesthetics
+```
+
+It compares four variants: `base` (no adapter), `global`, `personal` and `fused` (what
+`fedlora-generate` uses):
+
+| Metric | Meaning | Better |
+|---|---|---|
+| `heldout_loss` | Flow-matching loss on the held-out tensors, with the same noise and timesteps for every variant | lower |
+| `kad_to_reference` | Kernel Audio Distance (unbiased MMD, CLAP embeddings) between generations and the held-out songs. Works with few clips | lower |
+| `fad_to_reference` | Fréchet Audio Distance; reported only when there are more clips than embedding dimensions | lower |
+| `centroid_similarity` | Cosine similarity of the mean embeddings of generations and held-out songs | higher |
+| `prompt_adherence` | CLAP audio-text similarity between each clip and its prompt | higher |
+| `diversity` | Mean pairwise CLAP distance between generations; near 0 means repeated outputs | higher |
+| `copy` | Similarity of each generation to its nearest training song, and the share above `--copy-threshold` (0.95) | lower |
+| `aesthetics` | Meta Audiobox Aesthetics (CE, CU, PC, PQ), with `--aesthetics` and `pip install -e ".[eval-aesthetics]"` | higher |
+
+Everything stays in `<client-dir>/eval/runs/<timestamp>/` (`report.json`,
+`embeddings.safetensors`, the generated audio); nothing is sent to the server. The
+held-out and training song folders default to what `fedlora-prepare` recorded in
+`<client-dir>/sources.json`. Prompts come from `--prompts` (one per line), else the
+captions of a held-out dataset JSON, else a built-in list. CLAP
+(`laion/larger_clap_music`) is downloaded from Hugging Face on first use.
+
+The copy check is a screen, not proof: listen to any pair it flags, and remember a low
+score does not rule out a copied melody.
+
+## Benchmark on public data (FMA)
+
+`fedlora-benchmark` answers "does personalization work, and what does privacy cost?"
+on the [Free Music Archive](https://github.com/mdeff/fma) (Creative Commons audio with
+genre and artist labels). Each simulated client gets one genre (or one artist).
+
+```bash
+# 1. Download fma_metadata.zip and fma_small.zip (8,000 30 s clips, 8 genres) and unzip.
+# 2. Split into clients. Keep the output OUTSIDE this folder, or `flwr run` bundles it.
+fedlora-fma-partition --metadata-dir fma_metadata --audio-dir fma_small \
+    --out-dir ../fedlora-bench --num-clients 4 --group-by genre --tracks-per-client 40
+
+# 3. Prepare, train one simulation per noise level, evaluate, report.
+fedlora-benchmark --bench-dir ../fedlora-bench --ace-project-root ../ACE-Step-1.5 \
+    --sigmas 1,2,4,8 --rounds 10
+```
+
+The benchmark needs the `fedlora-sim` connection from `flwr-config.example.toml`; it
+sets the number of SuperNodes itself. Each stage skips work that is already done, so an
+interrupted run can be restarted, and `--stages report` rebuilds the tables alone.
+Results go to `../fedlora-bench/results.md` and `results.csv`: per noise level σ and
+variant, the ε each client spent, the mean of each metric above, and:
+
+- `personalization_gap`: mean distance from a client's generations to the *other*
+  clients' held-out songs minus the distance to its *own*. Positive means the adapters
+  learned that client's style.
+- `personalization_top1`: share of clients whose generations are closest to their own songs.
+
+These two exist only in simulation, where one machine holds every client's held-out songs.
+
+Cost: each σ is a full federated training run, and evaluation generates
+`prompts × samples-per-prompt` clips per variant per client. Start with 2 clients,
+`--tracks-per-client 10`, `--rounds 3` and one σ to check the pipeline.
+
 ## Tests
 
 ```bash
-pytest -q   # DP math, client-policy precedence, UI commands, adapter round-trip, exact fusion
+pytest -q        # DP math, client policy, full client round on a toy model, fusion,
+                 # eval metrics, FMA partitioning, benchmark report, UI commands
+pytest --cov     # with coverage
+ruff check . && ruff format --check .
 ```
+
+The tests use a small stand-in model, so they need neither ACE-Step nor a GPU. Outside
+ACE-Step's environment, install a CPU torch first:
+`pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -e ".[dev]"`.
+CI (`.github/workflows/ci.yml`) runs lint and tests on Python 3.11 and 3.12.

@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import re
 from collections import OrderedDict
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -78,6 +80,29 @@ def inject_dual_lora(model: nn.Module, spec: AdapterSpec) -> nn.Module:
         if m is not None:
             param.data = param.data.float()
     return model
+
+
+@contextmanager
+def only_adapters(model: nn.Module, adapters: Sequence[str]) -> Iterator[None]:
+    """Temporarily run the decoder with just ``adapters`` active (none = base model).
+
+    Used for evaluation. ``requires_grad`` flags are restored afterwards, because
+    PEFT's ``set_adapter`` re-enables gradients on every active adapter, which would
+    silently unfreeze the shared FFA-LoRA ``A`` matrices.
+    """
+    peft_decoder = model.decoder
+    flags = {n: p.requires_grad for n, p in model.named_parameters()}
+    try:
+        if adapters:
+            peft_decoder.base_model.set_adapter(list(adapters))
+            yield
+        else:
+            with peft_decoder.disable_adapter():
+                yield
+    finally:
+        peft_decoder.base_model.set_adapter([GLOBAL, PERSONAL])
+        for name, param in model.named_parameters():
+            param.requires_grad_(flags[name])
 
 
 def trainable_names(model: nn.Module, adapter: str) -> list[str]:

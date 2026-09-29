@@ -29,23 +29,28 @@ _TENSOR_KEYS = (
 )
 
 
-def build_loader(tensor_dir: Path, batch_size: int) -> DataLoader:
+def build_loader(tensor_dir: Path, batch_size: int, shuffle: bool = True) -> DataLoader:
     from acestep.training.data_module import (
         PreprocessedTensorDataset,
         collate_preprocessed_batch,
     )
+    from acestep.training.path_safety import set_safe_root
 
     if not tensor_dir.is_dir():
         raise FileNotFoundError(
             f"No local data at {tensor_dir}. Run `fedlora-prepare` on this client first."
         )
+    # ACE-Step only reads tensors under its "safe root", which defaults to the process's
+    # start-up directory. The client's own data folder (often elsewhere, e.g. under
+    # ~/Library/Application Support) is the trusted location here.
+    set_safe_root(str(tensor_dir))
     dataset = PreprocessedTensorDataset(str(tensor_dir))
     if len(dataset) == 0:
         raise ValueError(f"{tensor_dir} contains no preprocessed tensors")
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         collate_fn=collate_preprocessed_batch,
         num_workers=0,
         drop_last=False,
@@ -95,6 +100,26 @@ def flow_matching_loss(
         )
         loss = F.mse_loss(out[0], x1 - x0)
     return loss.float()
+
+
+@torch.no_grad()
+def heldout_loss(rt: Runtime, loader: DataLoader, seed: int = 0) -> float:
+    """Mean flow-matching loss on held-out tensors with fixed noise and timesteps.
+
+    The RNG is reseeded per batch and CFG dropout is off, so every adapter variant
+    sees exactly the same noise and ``t``: differences come from the weights alone.
+    Pass an unshuffled loader. Reseeds the global RNG; meant for eval processes.
+    """
+    was_training = rt.model.training
+    rt.model.eval()
+    losses: list[float] = []
+    for i, batch in enumerate(loader):
+        torch.manual_seed(seed + i)
+        loss = flow_matching_loss(rt, batch, cfg_ratio=0.0)
+        if torch.isfinite(loss):
+            losses.append(loss.item())
+    rt.model.train(was_training)
+    return sum(losses) / len(losses) if losses else math.nan
 
 
 def _batches(loader: DataLoader, steps: int) -> Iterator[dict[str, torch.Tensor]]:

@@ -3,3 +3,7 @@ server_out/
 __pycache__/
 *.pyc
 .venv/
+bench/
+.coverage
+coverage.xml
+.pytest_cache/

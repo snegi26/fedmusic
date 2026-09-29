@@ -64,6 +64,31 @@ class ClientStore:
     def log_path(self) -> Path:
         return self.state_dir / "train_log.jsonl"
 
+    @property
+    def eval_dir(self) -> Path:
+        """Held-out data and evaluation reports. Never used for training, never sent."""
+        return self.root / "eval"
+
+    @property
+    def eval_tensor_dir(self) -> Path:
+        """Held-out tensors from ``fedlora-prepare --split eval``."""
+        return self.eval_dir / "tensors"
+
+    @property
+    def sources_path(self) -> Path:
+        """Local record of which audio folder fed each split (for ``fedlora-eval``)."""
+        return self.root / "sources.json"
+
+    def load_sources(self) -> dict[str, str]:
+        if not self.sources_path.is_file():
+            return {}
+        return dict(json.loads(self.sources_path.read_text(encoding="utf-8")))
+
+    def record_source(self, split: str, audio_dir: Path) -> None:
+        sources = {**self.load_sources(), split: str(audio_dir)}
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.sources_path.write_text(json.dumps(sources, indent=2), encoding="utf-8")
+
     def load_tensors(self, path: Path) -> dict[str, torch.Tensor] | None:
         from safetensors.torch import load_file
 

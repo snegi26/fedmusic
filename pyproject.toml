@@ -20,12 +20,18 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = ["toga>=0.5"]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# Already present in ACE-Step's environment; listed for installs outside it.
+eval = ["soundfile>=0.12", "transformers>=4.51"]
+eval-aesthetics = ["audiobox_aesthetics"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
 
 [project.scripts]
 fedlora-prepare = "fedlora_music.prepare:main"
 fedlora-generate = "fedlora_music.generate:main"
 fedlora-identity = "fedlora_music.identity:main"
+fedlora-eval = "fedlora_music.evaluate:main"
+fedlora-fma-partition = "fedlora_music.benchmark.fma:main"
+fedlora-benchmark = "fedlora_music.benchmark.runner:main"
 
 [project.gui-scripts]
 fedlora-ui = "fedlora_music_ui.app:run"
@@ -113,3 +119,8 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["fedlora_music", "fedlora_music_ui"]
+# These modules only drive ACE-Step / Toga, which CI does not install.
+omit = ["fedlora_music_ui/app.py", "fedlora_music/prepare.py", "fedlora_music/generate.py"]
