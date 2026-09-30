@@ -1,0 +1,34 @@
+# Try the pipeline end to end without downloads: tone-based "genres" from
+#   fedlora-experiment synth --out ../synth-music
+# and four clients, each on a different simulated recording medium.
+name = "synthetic-eras"
+description = "Pipeline check: synthetic genres, one simulated medium per client, IID vs non-IID."
+tracks_per_client = 8
+eval_fraction = 0.25
+seed = 0
+
+[source]
+kind = "folders"
+root = "../synth-music"          # relative to --data-root (default: current folder)
+
+[[clients]]
+name = "drone-shellac"
+genres = ["drone"]
+vintage = "shellac-1920s"
+
+[[clients]]
+name = "pulse-tape"
+genres = ["pulse"]
+vintage = "tape-1950s"
+
+[[clients]]
+name = "percussion-cassette"
+genres = ["percussion"]
+vintage = "cassette-1980s"
+
+[[clients]]
+name = "arpeggio-clean"
+genres = ["arpeggio"]
+
+[sweep]
+mix = [0.0, 1.0]

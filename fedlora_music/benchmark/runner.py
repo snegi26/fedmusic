@@ -226,6 +226,7 @@ def stage_eval(args: argparse.Namespace, clients: Sequence[str]) -> None:
                     str(args.samples_per_prompt),
                     "--duration",
                     str(args.duration),
+                    *(["--no-embeddings"] if args.no_embeddings else []),
                     "--out-dir",
                     str(out_dir),
                 ]
@@ -358,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--variants", default=",".join(VARIANTS))
     ap.add_argument("--samples-per-prompt", type=int, default=1)
     ap.add_argument("--duration", type=float, default=30.0)
+    ap.add_argument(
+        "--no-embeddings", action="store_true", help="Evaluate without CLAP (offline, toy)"
+    )
     ap.add_argument("--num-cpus", type=float, default=4)
     ap.add_argument("--num-gpus", type=float, default=1.0)
     ap.add_argument("--stages", default=",".join(STAGES))

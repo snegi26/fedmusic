@@ -32,6 +32,7 @@ fedlora-identity = "fedlora_music.identity:main"
 fedlora-eval = "fedlora_music.evaluate:main"
 fedlora-fma-partition = "fedlora_music.benchmark.fma:main"
 fedlora-benchmark = "fedlora_music.benchmark.runner:main"
+fedlora-experiment = "fedlora_music.experiments.run:main"
 
 # Third-party model backends register here (name = "module:Class"); clients must
 # still list them in their node config's `allowed-backends` before they run.

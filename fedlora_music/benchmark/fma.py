@@ -37,6 +37,10 @@ class FmaTrack:
     genre_top: str
     genres: tuple[str, ...]
     subset: str
+    # Recording year, else album release year. For digitized archive material this is
+    # often the digitization date, not the original recording's: prefer the genre
+    # ("Old-Time / Historic") to find old recordings in FMA.
+    year: int | None = None
 
     @property
     def caption(self) -> str:
@@ -66,6 +70,14 @@ def read_genres(metadata_dir: Path) -> dict[int, str]:
         return {int(row["genre_id"]): row["title"] for row in csv.DictReader(fh)}
 
 
+def _year(row: list[str], col: dict[str, int], *keys: str) -> int | None:
+    for key in keys:
+        value = row[col[key]] if key in col else ""
+        if len(value) >= 4 and value[:4].isdigit():
+            return int(value[:4])
+    return None
+
+
 def read_tracks(metadata_dir: Path, subset: str) -> list[FmaTrack]:
     """Parse ``tracks.csv`` (three header rows) for tracks in ``subset``."""
     allowed = set(_SUBSETS[: _SUBSETS.index(subset) + 1])
@@ -87,6 +99,7 @@ def read_tracks(metadata_dir: Path, subset: str) -> list[FmaTrack]:
                     genre_top=row[col["track.genre_top"]],
                     genres=tuple(genre_names[g] for g in genre_ids if g in genre_names),
                     subset=row[col["set.subset"]],
+                    year=_year(row, col, "track.date_recorded", "album.date_released"),
                 )
             )
     return tracks

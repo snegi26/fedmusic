@@ -244,6 +244,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--skip-loss", action="store_true")
     ap.add_argument("--skip-generation", action="store_true")
+    ap.add_argument(
+        "--no-embeddings",
+        action="store_true",
+        help="Generate audio but skip CLAP metrics (offline, or the toy backend)",
+    )
     ap.add_argument("--aesthetics", action="store_true", help="Add Audiobox Aesthetics scores")
     ap.add_argument("--clap-checkpoint", default=None)
     ap.add_argument("--copy-threshold", type=float, default=0.95)
@@ -307,6 +312,10 @@ def main(argv: list[str] | None = None) -> int:
             args.seed,
             out_dir,
         )
+        report["generated"] = {
+            v: [str(p.relative_to(out_dir)) for p, _ in clips[v]] for v in variants
+        }
+    if not args.skip_generation and not args.no_embeddings:
         clap = ClapEmbedder(
             args.clap_checkpoint or DEFAULT_CLAP,
             device="cuda" if torch.cuda.is_available() else "cpu",

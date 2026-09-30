@@ -403,6 +403,23 @@ Cost: each σ is a full federated training run, and evaluation generates
 `prompts × samples-per-prompt` clips per variant per client. Start with 2 clients,
 `--tracks-per-client 10`, `--rounds 3` and one σ to check the pipeline.
 
+## Data experiments: older recordings, genres, eras
+
+`fedlora-experiment` runs controlled experiments on top of the benchmark: FMA's
+"Old-Time / Historic" recordings next to modern genres, one genre per client versus
+shuffled genres (a `mix` sweep), and the same music on simulated recording media
+(1920s shellac, 1950s tape, 1970s vinyl, 1980s cassette) to separate the sound of an
+era from its musical style. Besides the CLAP style metrics, the report measures
+whether generated audio picks up each client's era signature (bandwidth, noise,
+crackle, stereo). Definitions live in `experiments/*.toml`, and your own collection
+works too. See [experiments/README.md](experiments/README.md).
+
+```bash
+fedlora-experiment synth --out ../synth-music                       # no download needed
+fedlora-experiment run experiments/synthetic-eras.toml --out ../fedlora-exp \
+  --model-backend toy --sigmas 4 --rounds 2 --num-gpus 0 --no-embeddings --duration 2
+```
+
 ## Model backends
 
 The harness is model-agnostic. A backend (`fedlora_music/backends/`) supplies only

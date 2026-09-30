@@ -1,0 +1,32 @@
+# Template for your own collection of older music, split by recording decade.
+# Layout: my-music/<genre>/<files>, plus my-music/metadata.csv with columns
+#   path,genre,year,artist,caption      (path relative to my-music/)
+# Tracks without a year never match a client with `years`.
+name = "eras-by-year"
+description = "Your own recordings, one client per era."
+tracks_per_client = 20
+eval_fraction = 0.2
+seed = 0
+
+[source]
+kind = "folders"
+root = "my-music"
+
+[[clients]]
+name = "1920s-1940s"
+years = [1920, 1949]
+
+[[clients]]
+name = "1950s-1960s"
+years = [1950, 1969]
+
+[[clients]]
+name = "1970s-1980s"
+years = [1970, 1989]
+
+[[clients]]
+name = "1990s-now"
+years = [1990, 2030]
+
+[sweep]
+mix = [0.0, 1.0]

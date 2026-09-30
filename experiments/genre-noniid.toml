@@ -1,0 +1,42 @@
+# How much does genre skew across clients matter?
+# One genre per client (mix = 0, strongly non-IID) up to shuffled genres (mix = 1, IID).
+# Expect the personalization gap to shrink as mix grows, and the shared adapter's
+# held-out loss to improve. Needs fma_medium (or fma_large) for the older genres.
+name = "genre-noniid"
+description = "Six genres, one per client, from non-IID to IID."
+tracks_per_client = 30
+eval_fraction = 0.2
+seed = 0
+
+[source]
+kind = "fma"
+metadata_dir = "fma_metadata"
+audio_dir = "fma_medium"
+subset = "medium"
+
+[[clients]]
+name = "historic"
+genres = ["Old-Time / Historic"]
+
+[[clients]]
+name = "blues"
+genres = ["Blues"]
+
+[[clients]]
+name = "jazz"
+genres = ["Jazz"]
+
+[[clients]]
+name = "classical"
+genres = ["Classical"]
+
+[[clients]]
+name = "folk"
+genres = ["Folk"]
+
+[[clients]]
+name = "electronic"
+genres = ["Electronic"]
+
+[sweep]
+mix = [0.0, 0.5, 1.0]

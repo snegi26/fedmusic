@@ -1,0 +1,34 @@
+# Is the "old sound" learned separately from the music?
+# All clients hold the same genre; only the simulated recording medium differs.
+# Any personalization gap here comes from the medium, not from musical style: check
+# the era gap (bandwidth, hiss, crackle, stereo) in report.md.
+name = "simulated-media"
+description = "One genre, four simulated recording media."
+tracks_per_client = 30
+eval_fraction = 0.2
+seed = 0
+
+[source]
+kind = "fma"
+metadata_dir = "fma_metadata"
+audio_dir = "fma_small"
+subset = "small"
+
+[[clients]]
+name = "folk-clean"
+genres = ["Folk"]
+
+[[clients]]
+name = "folk-vinyl"
+genres = ["Folk"]
+vintage = "vinyl-1970s"
+
+[[clients]]
+name = "folk-tape"
+genres = ["Folk"]
+vintage = "tape-1950s"
+
+[[clients]]
+name = "folk-shellac"
+genres = ["Folk"]
+vintage = "shellac-1920s"

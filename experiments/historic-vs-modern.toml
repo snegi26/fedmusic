@@ -1,0 +1,36 @@
+# Do clients with old recordings benefit from, or get drowned out by, modern clients?
+# Two clients hold FMA's "Old-Time / Historic" recordings (digitized 78s and early
+# recordings); three hold modern genres with related instrumentation. Compare the
+# historic clients' personalization gap and era gap with the modern ones', and
+# across noise levels (sweep sigma with --sigmas).
+name = "historic-vs-modern"
+description = "Old recordings federated with related modern genres."
+tracks_per_client = 30
+eval_fraction = 0.2
+seed = 0
+
+[source]
+kind = "fma"
+metadata_dir = "fma_metadata"
+audio_dir = "fma_medium"
+subset = "medium"
+
+[[clients]]
+name = "historic-a"
+genres = ["Old-Time / Historic"]
+
+[[clients]]
+name = "historic-b"
+genres = ["Old-Time / Historic"]
+
+[[clients]]
+name = "folk"
+genres = ["Folk"]
+
+[[clients]]
+name = "country"
+genres = ["Country"]
+
+[[clients]]
+name = "blues"
+genres = ["Blues"]
