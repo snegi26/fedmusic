@@ -29,6 +29,125 @@ Design choices:
 - The ACE-Step training step reuses ACE-Step's corrected trainer (`training_v2`): logit-normal timesteps from the model config, CFG dropout, flow-matching MSE.
 - **Model backends**: everything model-specific (loading, data preparation, loss, generation) sits behind one interface; the federation, DP and adapter math don't change per model. The server sends a fingerprint of its base weights, and clients with different weights refuse to train rather than corrupt the average.
 
+## Linux quick start
+
+Three ways to run on Linux, from simplest to most isolated. Each starts with the
+toy-model check (`env/smoke.sh`, about a minute on CPU) so you know the setup works
+before spending GPU time on ACE-Step.
+
+| Path | Needs | Isolation | GPU |
+|---|---|---|---|
+| **A. Directly on the host** | Python 3.11/3.12, uv, git | none | yes |
+| **B. gVisor sandbox** | Docker (+ NVIDIA Container Toolkit for GPU) | user-space kernel | shared with the host |
+| **C. Cloud Hypervisor microVM** | KVM, IOMMU, a GPU you can dedicate | hardware VM | whole card; the host loses it |
+
+Start with A. Use B when you join someone else's federation. C only pays off with a
+spare GPU and a need for the strongest isolation.
+
+### A. Directly on the host
+
+```bash
+# 1. Toy-model check (no GPU, no model download)
+git clone https://github.com/snegi26/fedmusic.git && cd fedmusic
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[dev]"
+env/smoke.sh                       # lint, tests, 2-client federation, eval, generation
+deactivate
+```
+
+2. Install ACE-Step next to this repository and install fedlora-music into its
+environment, as in [Setup](#setup). Check that the GPU is visible from ACE-Step's
+environment: `python -c "import torch; print(torch.cuda.is_available())"`.
+
+3. Simulate a federation on one machine (one folder of songs per simulated client):
+
+```bash
+fedlora-prepare --audio-dir ~/songs/alice --client-dir clients/client-0
+fedlora-prepare --audio-dir ~/songs/bob   --client-dir clients/client-1
+fedlora-prepare --audio-dir ~/songs/alice-heldout --client-dir clients/client-0 --split eval
+
+mkdir -p ~/.flwr && cat >> ~/.flwr/config.toml <<'CFG'
+[superlink.fedlora-sim]
+address = ":local:"
+CFG
+
+env/local-superlink.sh start       # always before `flwr run` (see below)
+flwr run . fedlora-sim --stream \
+  --federation-config "num-supernodes=2 client-resources-num-cpus=4 client-resources-num-gpus=1.0"
+env/local-superlink.sh stop
+
+fedlora-generate --client-dir clients/client-0 --caption "warm lo-fi hip hop, dusty drums" --duration 60
+fedlora-eval --client-dir clients/client-0
+```
+
+`env/local-superlink.sh` stops Flower 1.39 from installing a second torch from PyPI
+for every run, which would shadow ACE-Step's CUDA build. `client-resources-num-gpus=1.0`
+makes simulated clients take turns on one GPU; each loads the model (about 5 GB).
+
+4. To join a real federation instead, follow [Run in deployment](#run-in-deployment-one-machine-per-client).
+
+### B. gVisor sandbox
+
+The same workflow in a sandbox that sees only the repository (read-only), your data
+folder, your songs (read-only) and the checkpoints, with no Linux capabilities, a
+read-only root filesystem and no network unless a step needs it.
+
+```bash
+sudo env/gvisor/install-host.sh          # once: gVisor + Docker runtimes, driver check
+C="docker compose -f env/gvisor/compose.yaml"
+$C build dev acestep
+$C run --rm smoke                        # CPU sandbox check
+$C run --rm gpu-check                    # CUDA inside the sandbox
+
+mkdir -p .fedmusic/{data/keys,songs/train,songs/eval,models}   # as your user, first
+$C run --rm download                     # ACE-Step checkpoints into .fedmusic/models
+$C run --rm identity                     # key pair in .fedmusic/data/keys; send the .pub
+cp env/gvisor/node_config.example.toml .fedmusic/data/node_config.toml
+cp /path/to/ca.crt .fedmusic/data/keys/
+$C run --rm prepare                      # songs in .fedmusic/songs/train; SPLIT=eval for held-out
+SUPERLINK=fl.example.org:9092 $C run --rm supernode
+$C run --rm evaluate
+CAPTION="dreamy synthwave" $C run --rm generate   # -> .fedmusic/data/generated
+```
+
+Create the `.fedmusic` folders yourself before the first run: Docker would create
+missing ones as root, and the sandbox runs as your user ID. Details in
+[env/README.md](env/README.md#2-gvisor-sandbox-linux--nvidia).
+
+### C. Cloud Hypervisor microVM
+
+Needs virtualization and the IOMMU enabled in firmware, and `intel_iommu=on iommu=pt`
+(or `amd_iommu=on`) on the kernel command line.
+
+```bash
+sudo apt install virtiofsd qemu-utils mtools dosfstools iptables
+env/cloud-hypervisor/host-check.sh                          # checks; lists GPUs + IOMMU groups
+env/cloud-hypervisor/image.sh                               # as your user
+sudo GPU=0000:01:00.0 env/cloud-hypervisor/vfio-bind.sh     # the host loses this GPU
+sudo GPU=0000:01:00.0 env/cloud-hypervisor/run.sh           # first boot takes a while
+ssh fed@192.168.249.2                                       # from another terminal:
+#   cd /workspace && env/smoke.sh && nvidia-smi
+sudo GPU=0000:01:00.0 env/cloud-hypervisor/vfio-unbind.sh   # give the GPU back
+```
+
+The first boot installs the NVIDIA driver and ACE-Step in the guest (tens of
+minutes), then reboots once. Details in
+[env/README.md](env/README.md#3-cloud-hypervisor-microvm-linux--spare-nvidia-gpu).
+
+### Common problems
+
+- **`torch.cuda.is_available()` is `False`**: activate ACE-Step's `.venv`, not a
+  separate one with CPU torch.
+- **Out of GPU memory**: keep `client-resources-num-gpus=1.0`, or lower `local-steps`
+  or `batch-size` in `pyproject.toml`.
+- **Client refuses with a model mismatch**: your checkpoints differ from the
+  server's; download the same variant.
+- **Client refuses with "privacy budget exhausted"**: it has spent its
+  `epsilon-budget`, as intended.
+- **`flwr run` fails with "Failed to start local SuperLink"** behind an HTTP proxy:
+  add `127.0.0.1,localhost` to `NO_PROXY`.
+
 ## Setup
 
 fedlora-music runs inside ACE-Step 1.5's Python environment. ACE-Step pins

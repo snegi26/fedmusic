@@ -70,7 +70,9 @@ GPU support needs an NVIDIA driver version that the installed gVisor release kno
 (`runsc nvproxy list-supported-drivers`); `install-host.sh` checks this.
 
 Client workflow (folders: `FEDMUSIC_DATA`, `FEDMUSIC_SONGS`, `FEDMUSIC_MODELS`,
-defaulting to `.fedmusic/…`):
+defaulting to `.fedmusic/…`). Create them as your user before the first run, e.g.
+`mkdir -p .fedmusic/{data/keys,songs/train,songs/eval,models}`: Docker creates missing
+ones as root, and the sandbox runs as your user ID and could not write to them.
 
 ```bash
 C="docker compose -f env/gvisor/compose.yaml run --rm"
