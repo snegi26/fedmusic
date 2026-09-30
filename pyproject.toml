@@ -7,7 +7,7 @@ name = "fedlora-music"
 version = "0.1.0"
 description = "Federated, privacy-preserving LoRA personalization of ACE-Step 1.5 music generation with Flower"
 readme = "README.md"
-license = "MIT"
+license = { file = "LICENSE" }  # MIT; flwr requires the file form
 requires-python = ">=3.11,<3.13"
 # torch, transformers and ace-step are intentionally NOT listed: ACE-Step pins
 # platform-specific torch wheels via its own uv index config, so install this
@@ -32,6 +32,10 @@ fedlora-identity = "fedlora_music.identity:main"
 fedlora-eval = "fedlora_music.evaluate:main"
 fedlora-fma-partition = "fedlora_music.benchmark.fma:main"
 fedlora-benchmark = "fedlora_music.benchmark.runner:main"
+
+# Third-party model backends register here (name = "module:Class"); clients must
+# still list them in their node config's `allowed-backends` before they run.
+# [project.entry-points."fedlora_music.backends"]
 
 [project.gui-scripts]
 fedlora-ui = "fedlora_music_ui.app:run"
@@ -75,9 +79,13 @@ serverapp = "fedlora_music.server_app:app"
 clientapp = "fedlora_music.client_app:app"
 
 [tool.flwr.app.config]
+# Model --------------------------------------------------------------------
+# Backend: "acestep" (ACE-Step 1.5) or "toy" (tiny CPU stand-in for tests and VMs).
+# Clients only run backends their node config allows (`allowed-backends`).
+model-backend = "acestep"
+model-root = "../ACE-Step-1.5"            # acestep: the checkout holding ./checkpoints
+model-variant = ""                        # "" = backend default (acestep-v15-turbo)
 # Paths --------------------------------------------------------------------
-ace-project-root = "../ACE-Step-1.5"      # must contain ./checkpoints
-model-variant = "acestep-v15-turbo"       # checkpoint subdir / handler config_path
 clients-root = "./clients"                # each client reads ONLY <root>/client-<partition-id>
 server-output-dir = "./server_out"
 # Federation ---------------------------------------------------------------

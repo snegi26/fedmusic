@@ -1,0 +1,43 @@
+#cloud-config
+# First boot of the fedlora-music microVM: user, virtiofs shares, NVIDIA driver,
+# ACE-Step environment, then a reboot to load the driver. Filled in by image.sh.
+hostname: fedmusic
+users:
+  - name: @USER@
+    uid: 1000  # files written to the shared folders are owned by uid 1000 on the host
+    groups: [sudo, video, render]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - @SSH_KEY@
+ssh_pwauth: false
+
+mounts:
+  - [repo, /workspace, virtiofs, "defaults,nofail", "0", "0"]
+  - [data, /data, virtiofs, "defaults,nofail", "0", "0"]
+  - [models, /models/checkpoints, virtiofs, "defaults,nofail", "0", "0"]
+
+package_update: true
+packages: [ubuntu-drivers-common]
+
+runcmd:
+  - [bash, -c, "mkdir -p /workspace /data /models/checkpoints && mount -a"]
+  # Headless datacenter driver, plus nvidia-smi from the matching utils package.
+  - - bash
+    - -c
+    - |
+      ubuntu-drivers install --gpgpu
+      v="$(dpkg -l | grep -oP 'nvidia-headless-no-dkms-\K[0-9]+(?=-server)' | head -1)"
+      [ -n "$v" ] && apt-get install -y "nvidia-utils-$v-server"
+  - - bash
+    - -c
+    - |
+      bash /workspace/env/provision.sh --profile acestep --repo /workspace \
+        --checkpoints /models/checkpoints > /var/log/fedmusic-provision.log 2>&1 &&
+      touch /var/lib/fedmusic-provisioned
+
+power_state:
+  mode: reboot
+  message: rebooting to load the NVIDIA driver
+  condition: true

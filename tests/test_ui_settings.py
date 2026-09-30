@@ -30,6 +30,8 @@ def test_node_config_is_valid_toml_with_client_policy(tmp_path: Path) -> None:
     assert cfg["epsilon-budget"] == 7.5
     assert cfg["min-noise-multiplier"] == 3.0
     assert cfg["max-dp-delta"] == 1e-5
+    assert cfg["model-root"] == str((tmp_path / "ace").resolve())
+    assert cfg["allowed-backends"] == "acestep"  # only the model this client set up
 
 
 def test_supernode_cmd_secure_by_default(tmp_path: Path) -> None:
@@ -61,11 +63,20 @@ def test_settings_roundtrip_ignores_unknown_keys(tmp_path: Path) -> None:
     assert Settings.load(path).superlink == "fl.example.org:9092"
 
 
-def test_read_status(tmp_path: Path) -> None:
+def test_read_status_spans_models(tmp_path: Path) -> None:
     s = _settings(tmp_path)
-    state = s.data / "state"
-    state.mkdir(parents=True)
-    (state / "privacy_ledger.json").write_text(json.dumps({"noise_multipliers": [4.0, 4.0]}))
-    (state / "train_log.jsonl").write_text(json.dumps({"epsilon": 3.2, "loss": 0.5}) + "\n")
+    (s.data / "state").mkdir(parents=True)
+    (s.data / "state" / "privacy_ledger.json").write_text(
+        json.dumps({"noise_multipliers": [4.0, 4.0, 4.0]})
+    )
+    other = s.data / "models" / "toy" / "tiny" / "state"
+    other.mkdir(parents=True)
+    (other / "train_log.jsonl").write_text(json.dumps({"ts": 2, "epsilon": 4.1, "loss": 9}) + "\n")
+    (s.model_dir / "state").mkdir(parents=True)
+    (s.model_dir / "state" / "train_log.jsonl").write_text(
+        json.dumps({"ts": 1, "epsilon": 3.2, "loss": 0.5}) + "\n"
+    )
     st = read_status(s)
-    assert (st.rounds, st.epsilon, st.last_loss) == (2, 3.2, 0.5)
+    # Epsilon is the latest total across models; the loss is the chosen model's.
+    assert (st.rounds, st.epsilon, st.last_loss) == (3, 4.1, 0.5)
+    assert s.model_dir == s.data / "models" / "acestep" / "acestep-v15-turbo"

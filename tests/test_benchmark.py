@@ -22,6 +22,7 @@ from fedlora_music.benchmark.runner import (
     summarize,
     to_toml,
 )
+from fedlora_music.config import ModelSpec
 from fedlora_music.embeddings import list_audio
 from fedlora_music.privacy import epsilon_after
 
@@ -93,19 +94,19 @@ def test_write_partition_emits_ace_step_dataset_json(tmp_path: Path) -> None:
 
 def test_run_config_round_trips_through_toml(tmp_path: Path) -> None:
     cfg = run_config(
-        ace_project_root=tmp_path / "ace",
+        model=ModelSpec(backend="acestep", root=tmp_path / "ace", variant=""),
         clients_root=tmp_path / 'we"ird',
         server_output_dir=tmp_path / "out",
         num_clients=3,
         rounds=10,
         sigma=4.0,
         delta=1e-5,
-        model_variant=None,
     )
     parsed = tomllib.loads(to_toml(cfg))
     assert parsed == cfg
     assert parsed["dp-epsilon-budget"] > epsilon_after(10, 4.0, 1e-5)
-    assert "model-variant" not in parsed
+    assert (parsed["model-backend"], parsed["model-variant"]) == ("acestep", "")
+    assert parsed["model-root"] == str(tmp_path / "ace")
     assert federation_config(3, 4, 1.0) == (
         "num-supernodes=3 client-resources-num-cpus=4 client-resources-num-gpus=1"
     )
@@ -168,7 +169,7 @@ def test_report_stage_aggregates_eval_outputs(tmp_path: Path) -> None:
             save_file(emb, str(out / "embeddings.safetensors"))
 
     assert runner.main([
-        "--bench-dir", str(bench), "--ace-project-root", str(tmp_path / "ace"),
+        "--bench-dir", str(bench), "--model-root", str(tmp_path / "ace"),
         "--app-dir", str(app), "--sigmas", "1,4", "--variants", "base,fused",
         "--stages", "report",
     ]) == 0  # fmt: skip
@@ -188,6 +189,6 @@ def test_bench_dir_inside_app_dir_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit):
         runner.main([
-            "--bench-dir", str(tmp_path / "app" / "bench"), "--ace-project-root", str(tmp_path),
+            "--bench-dir", str(tmp_path / "app" / "bench"), "--model-root", str(tmp_path),
             "--app-dir", str(tmp_path / "app"),
         ])  # fmt: skip

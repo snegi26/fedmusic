@@ -1,6 +1,8 @@
-"""Dual-adapter LoRA plumbing for the ACE-Step DiT decoder.
+"""Dual-adapter LoRA plumbing, independent of the base model.
 
-Two PEFT LoRA adapters live side by side on the decoder's attention projections:
+Each model backend names the submodule that gets the adapters (its ``adapter_root``;
+``decoder`` for ACE-Step's DiT). Two PEFT LoRA adapters live side by side on that
+submodule's target projections:
 
 * ``global``   - federated. Its (clipped, noised) update is the ONLY thing a client
                  ever sends. With ``freeze_global_a`` (FFA-LoRA) the random ``A``
@@ -9,7 +11,8 @@ Two PEFT LoRA adapters live side by side on the decoder's attention projections:
 
 Both are active in the forward pass, so ``W' = W + s_g B_g A_g + s_p B_p A_p``.
 For inference the pair is fused into one standard PEFT adapter by stacking along the
-rank dimension, which ACE-Step's ``AceStepHandler.load_lora`` loads as-is.
+rank dimension: a standard PEFT adapter directory (ACE-Step's
+``AceStepHandler.load_lora`` loads it as-is).
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ PERSONAL = "personal"
 _KEY_RE = re.compile(r"^(?P<prefix>.+)\.lora_(?P<ab>[AB])\.(?P<adapter>[^.]+)\.weight$")
 
 StateDict = OrderedDict[str, torch.Tensor]
+DEFAULT_ROOT = "decoder"
 
 
 def _lora_config(spec: AdapterSpec, rank: int, alpha: int) -> LoraConfig:
@@ -57,19 +61,21 @@ def is_param_of(name: str, adapter: str) -> bool:
     return m is not None and m["adapter"] == adapter
 
 
-def inject_dual_lora(model: nn.Module, spec: AdapterSpec) -> nn.Module:
-    """Wrap ``model.decoder`` with the ``global`` and ``personal`` adapters, both active.
+def inject_dual_lora(model: nn.Module, spec: AdapterSpec, root: str = DEFAULT_ROOT) -> nn.Module:
+    """Wrap ``model.<root>`` with the ``global`` and ``personal`` adapters, both active.
 
     All base weights are frozen; adapter weights are kept in fp32 for stable
     optimisation (the base runs in bf16 under autocast).
     """
-    peft_decoder = get_peft_model(
-        model.decoder, _lora_config(spec, spec.global_rank, spec.global_alpha), adapter_name=GLOBAL
+    peft_root = get_peft_model(
+        getattr(model, root),
+        _lora_config(spec, spec.global_rank, spec.global_alpha),
+        adapter_name=GLOBAL,
     )
-    peft_decoder.add_adapter(PERSONAL, _lora_config(spec, spec.personal_rank, spec.personal_alpha))
+    peft_root.add_adapter(PERSONAL, _lora_config(spec, spec.personal_rank, spec.personal_alpha))
     # PeftModel.set_adapter takes a single name; the tuner accepts a list.
-    peft_decoder.base_model.set_adapter([GLOBAL, PERSONAL])
-    model.decoder = peft_decoder
+    peft_root.base_model.set_adapter([GLOBAL, PERSONAL])
+    setattr(model, root, peft_root)
 
     for name, param in model.named_parameters():
         m = _parse(name)
@@ -83,24 +89,26 @@ def inject_dual_lora(model: nn.Module, spec: AdapterSpec) -> nn.Module:
 
 
 @contextmanager
-def only_adapters(model: nn.Module, adapters: Sequence[str]) -> Iterator[None]:
+def only_adapters(
+    model: nn.Module, adapters: Sequence[str], root: str = DEFAULT_ROOT
+) -> Iterator[None]:
     """Temporarily run the decoder with just ``adapters`` active (none = base model).
 
     Used for evaluation. ``requires_grad`` flags are restored afterwards, because
     PEFT's ``set_adapter`` re-enables gradients on every active adapter, which would
     silently unfreeze the shared FFA-LoRA ``A`` matrices.
     """
-    peft_decoder = model.decoder
+    peft_root = getattr(model, root)
     flags = {n: p.requires_grad for n, p in model.named_parameters()}
     try:
         if adapters:
-            peft_decoder.base_model.set_adapter(list(adapters))
+            peft_root.base_model.set_adapter(list(adapters))
             yield
         else:
-            with peft_decoder.disable_adapter():
+            with peft_root.disable_adapter():
                 yield
     finally:
-        peft_decoder.base_model.set_adapter([GLOBAL, PERSONAL])
+        peft_root.base_model.set_adapter([GLOBAL, PERSONAL])
         for name, param in model.named_parameters():
             param.requires_grad_(flags[name])
 
@@ -155,11 +163,12 @@ def fuse_adapters(
     global_state: dict[str, torch.Tensor],
     personal_state: dict[str, torch.Tensor],
     spec: AdapterSpec,
+    root: str = DEFAULT_ROOT,
 ) -> StateDict:
     """Fuse both adapters into one rank ``r_g + r_p`` adapter with scaling 1.
 
     ``s_g B_g A_g + s_p B_p A_p == [s_g B_g | s_p B_p] @ [A_g ; A_p]`` exactly.
-    Returned keys follow the PEFT on-disk convention relative to the decoder
+    Returned keys follow the PEFT on-disk convention relative to ``model.<root>``
     (``base_model.model.<path>.lora_{A,B}.weight``).
     """
     s_g = spec.global_alpha / spec.global_rank
@@ -184,7 +193,7 @@ def fuse_adapters(
     for prefix in sorted(g):
         a = torch.cat([g[prefix]["A"], p[prefix]["A"]], dim=0)  # (r_g + r_p, in)
         b = torch.cat([s_g * g[prefix]["B"], s_p * p[prefix]["B"]], dim=1)  # (out, r_g + r_p)
-        rel = prefix.removeprefix("decoder.")
+        rel = prefix.removeprefix(f"{root}.")
         fused[f"{rel}.lora_A.weight"] = a.contiguous()
         fused[f"{rel}.lora_B.weight"] = b.contiguous()
     return fused
@@ -195,11 +204,12 @@ def export_fused_adapter(
     personal_state: dict[str, torch.Tensor],
     spec: AdapterSpec,
     out_dir: Path,
+    root: str = DEFAULT_ROOT,
 ) -> Path:
-    """Write a standard PEFT adapter directory loadable by ``AceStepHandler.load_lora``."""
+    """Write a standard PEFT adapter directory (``PeftModel.from_pretrained`` loads it)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     rank = spec.global_rank + spec.personal_rank
-    fused = fuse_adapters(global_state, personal_state, spec)
+    fused = fuse_adapters(global_state, personal_state, spec, root)
     save_file(fused, str(out_dir / "adapter_model.safetensors"))
     cfg = _lora_config(spec, rank=rank, alpha=rank)  # alpha / r == 1: scales folded into B
     cfg.lora_dropout = 0.0

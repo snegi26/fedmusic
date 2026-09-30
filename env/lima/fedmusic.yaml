@@ -1,0 +1,56 @@
+# Lima VM for fedlora-music development (component 1 of env/README.md).
+#
+# macOS 13+ (Apple Silicon or Intel) via Apple's Virtualization.framework, with the
+# repository shared read-write over virtiofs. CPU only: a Linux VM on a Mac cannot
+# use the Apple GPU (MPS), so real ACE-Step training runs on the host (README "Setup")
+# and this VM is for development, tests and toy-backend federation runs.
+#
+# Use env/lima/up.sh rather than `limactl start` directly: it sets the repository
+# mount and the parameters below. Needs Lima >= 1.0 (`brew install lima`).
+minimumLimaVersion: "1.0.0"
+
+vmType: vz
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 4
+memory: "8GiB"
+disk: "40GiB"
+
+# up.sh replaces this with the repository, read-write, at the same path as on the host.
+mountType: virtiofs
+mounts: []
+
+# Filled in by up.sh: REPO (absolute repository path) and PROFILE (dev or acestep).
+param:
+  REPO: ""
+  PROFILE: "dev"
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      # Mounts can appear a moment after boot.
+      for _ in $(seq 1 60); do
+        [ -f "${PARAM_REPO}/env/provision.sh" ] && break
+        sleep 1
+      done
+      [ -f /opt/fedmusic/.provisioned ] && exit 0
+      bash "${PARAM_REPO}/env/provision.sh" --profile "${PARAM_PROFILE}" --repo "${PARAM_REPO}"
+      mkdir -p /opt/fedmusic && touch /opt/fedmusic/.provisioned
+
+probes:
+  - description: fedlora-music provisioning finished
+    script: |
+      #!/bin/bash
+      set -eu
+      timeout 1800 bash -c 'until [ -f /opt/fedmusic/.provisioned ]; do sleep 5; done'
+    hint: See /var/log/cloud-init-output.log inside the VM (limactl shell fedmusic).
+
+message: |
+  fedlora-music VM ready. Run the end-to-end check with:
+    env/lima/run.sh env/smoke.sh

@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7
+# fedlora-music runtime image: one definition for the Linux environments.
+#
+#   dev      CPU only: tests, lint, toy-backend federation (~2 GB)
+#   acestep  + ACE-Step 1.5 with CUDA torch, for the gVisor GPU sandbox (large)
+#
+# Build from the repository root:
+#   docker build -f env/image/Containerfile --target dev -t fedmusic:dev .
+#   docker build -f env/image/Containerfile --target acestep -t fedmusic:acestep .
+#
+# Behind a TLS-intercepting proxy, pass its CA as a build secret (it is used for the
+# build only and removed from the final image):
+#   docker build --secret id=ca,src=/path/to/ca.crt ...
+#
+# Model checkpoints are never baked in; mount them at /models/checkpoints.
+# If Docker Hub rate-limits you, use a mirror of the same official image, e.g.
+#   --build-arg BASE_IMAGE=public.ecr.aws/docker/library/ubuntu:24.04
+
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE} AS base
+# 1: fetch Ubuntu packages over HTTPS (for HTTPS-only proxies)
+ARG APT_HTTPS=0
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    UV_CACHE_DIR=/opt/uv-cache \
+    UV_LINK_MODE=copy \
+    RUFF_NO_CACHE=true
+COPY env/provision.sh /usr/local/lib/fedmusic/provision.sh
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then \
+      mkdir -p /usr/local/share/ca-certificates /etc/ssl/certs && \
+      cp /run/secrets/ca /usr/local/share/ca-certificates/build-ca.crt && \
+      cat /run/secrets/ca >> /etc/ssl/certs/ca-certificates.crt; \
+    fi && \
+    APT_HTTPS=$APT_HTTPS bash /usr/local/lib/fedmusic/provision.sh --only-system && \
+    mkdir -p /opt/uv-cache /workspace /data /models/checkpoints && \
+    chown ubuntu:ubuntu /opt/uv-cache /workspace /data /models /models/checkpoints
+WORKDIR /workspace
+
+# -- dev: CPU-only toolchain ------------------------------------------------------
+FROM base AS dev
+# Torch wheel index; "pypi" if PyTorch's own index is unreachable (bigger image).
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+# Torch first, in its own layer, so editing the repo does not reinstall it.
+RUN uv venv --python python3.12 /opt/fedmusic/venv && \
+    if [ "$TORCH_INDEX" = pypi ]; then idx=""; else idx="--index-url $TORCH_INDEX"; fi && \
+    uv pip install --no-cache --python /opt/fedmusic/venv/bin/python torch $idx
+COPY --chown=ubuntu:ubuntu . /workspace
+RUN TORCH_INDEX=$TORCH_INDEX bash /workspace/env/provision.sh --profile dev --no-system \
+      --repo /workspace && \
+    chown -R ubuntu:ubuntu /opt/uv-cache
+ENV PATH=/opt/fedmusic/venv/bin:$PATH \
+    VIRTUAL_ENV=/opt/fedmusic/venv
+USER ubuntu
+# Validates the image end to end (toy backend federation, evaluation, generation).
+RUN env/smoke.sh --no-tests
+USER root
+RUN rm -f /usr/local/share/ca-certificates/build-ca.crt && update-ca-certificates --fresh >/dev/null
+USER ubuntu
+CMD ["bash"]
+
+# -- acestep: ACE-Step 1.5 + CUDA torch (the driver comes from the host) ------------
+FROM base AS acestep
+COPY --chown=ubuntu:ubuntu . /workspace
+RUN bash /workspace/env/provision.sh --profile acestep --no-system --repo /workspace \
+      --checkpoints /models/checkpoints && \
+    chown -R ubuntu:ubuntu /opt/ACE-Step-1.5 /opt/uv-cache
+ENV PATH=/opt/ACE-Step-1.5/.venv/bin:$PATH \
+    VIRTUAL_ENV=/opt/ACE-Step-1.5/.venv \
+    FEDLORA_MODEL_ROOT=/opt/ACE-Step-1.5 \
+    PYTORCH_ENABLE_MPS_FALLBACK=1
+USER ubuntu
+RUN env/smoke.sh --no-tests
+USER root
+RUN rm -f /usr/local/share/ca-certificates/build-ca.crt && update-ca-certificates --fresh >/dev/null
+USER ubuntu
+CMD ["bash"]

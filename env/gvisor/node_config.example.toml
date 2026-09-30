@@ -1,0 +1,8 @@
+# Client policy for the gVisor `supernode` service. Copy to $FEDMUSIC_DATA/node_config.toml.
+# Paths are inside the sandbox (see env/gvisor/compose.yaml mounts).
+data-dir = "/data/client"
+model-root = "/opt/ACE-Step-1.5"
+allowed-backends = "acestep"   # only run the model this machine was set up for
+epsilon-budget = 10.0          # never spend more than this in total
+min-noise-multiplier = 1.0     # never accept less noise than this
+max-dp-delta = 1e-5

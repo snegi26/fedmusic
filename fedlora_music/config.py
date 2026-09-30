@@ -5,8 +5,9 @@ Two sources, with different trust:
 * **Run config** (``[tool.flwr.app.config]``) - set by whoever submits the run,
   i.e. the federation operator. Shared by all clients.
 * **Node config** (``flower-supernode --node-config``) - set by the client on its
-  own machine. Holds local paths and the client's privacy floor. The run config
-  can make privacy stricter than the node's floor, never looser.
+  own machine. Holds local paths, the client's privacy floor and the model backends
+  it is willing to run. The run config can make privacy stricter than the node's
+  floor, never looser, and can only pick a backend the node allows.
 """
 
 from __future__ import annotations
@@ -40,17 +41,29 @@ class AdapterSpec:
                 raise ValueError(f"{name} must be > 0, got {value}")
 
 
+# Backends shipped with this package. Only these run unless a client's node config
+# lists others in ``allowed-backends`` (see ``LocalPolicy``).
+BUILTIN_BACKENDS: frozenset[str] = frozenset({"acestep", "toy"})
+
+
+def _legacy_root(cfg: Mapping[str, Any]) -> Any:
+    """``model-root``, falling back to the pre-backend key ``ace-project-root``."""
+    return cfg.get("model-root") or cfg.get("ace-project-root") or None
+
+
 @dataclass(frozen=True)
 class ModelSpec:
-    """Which base model to load. Hashable so it can key the model cache."""
+    """Which base model to load. Hashable so it can key the model cache.
 
-    ace_project_root: Path
-    model_variant: str
-    adapters: AdapterSpec
+    ``backend`` names a model backend (see ``fedlora_music.backends``). ``root`` is
+    the backend's install folder (ACE-Step: the checkout that holds ``checkpoints/``)
+    and ``variant`` a model inside it; an empty variant means the backend's default.
+    """
 
-    @property
-    def checkpoint_dir(self) -> Path:
-        return self.ace_project_root / "checkpoints"
+    backend: str
+    root: Path | None
+    variant: str
+    adapters: AdapterSpec | None = None  # not needed to prepare data or generate
 
 
 @dataclass(frozen=True)
@@ -107,10 +120,12 @@ class FedLoRAConfig:
             lora_dropout=float(rc["lora-dropout"]),
             freeze_global_a=bool(rc["freeze-global-a"]),
         )
+        root = _legacy_root(rc)
         return cls(
             model=ModelSpec(
-                ace_project_root=Path(str(rc["ace-project-root"])).expanduser().resolve(),
-                model_variant=str(rc["model-variant"]),
+                backend=str(rc.get("model-backend", "acestep")),
+                root=Path(str(root)).expanduser().resolve() if root else None,
+                variant=str(rc.get("model-variant", "")),
                 adapters=adapters,
             ),
             privacy=PrivacySpec(
@@ -143,26 +158,35 @@ class LocalPolicy:
 
     Keys (all optional; simulation passes only ``partition-id``):
       ``data-dir``              this client's data folder (deployment mode)
-      ``ace-project-root``      local ACE-Step checkout
+      ``model-root``            local model install (``ace-project-root`` still works)
+      ``allowed-backends``      comma-separated backends this client will run;
+                                default: the built-in ones
       ``epsilon-budget``        max total epsilon this client will ever spend
       ``min-noise-multiplier``  lowest sigma this client accepts
       ``max-dp-delta``          largest delta this client accepts
     """
 
     data_dir: Path | None = None
-    ace_project_root: Path | None = None
+    model_root: Path | None = None
+    allowed_backends: frozenset[str] = BUILTIN_BACKENDS
     epsilon_budget: float | None = None
     min_noise_multiplier: float = 0.0
     max_delta: float = 1.0
 
     @classmethod
     def from_node_config(cls, nc: Mapping[str, Any]) -> LocalPolicy:
-        def path(key: str) -> Path | None:
-            return Path(str(nc[key])).expanduser().resolve() if key in nc else None
+        def path(value: Any) -> Path | None:
+            return Path(str(value)).expanduser().resolve() if value else None
 
+        allowed = BUILTIN_BACKENDS
+        if "allowed-backends" in nc:
+            allowed = frozenset(
+                b.strip() for b in str(nc["allowed-backends"]).split(",") if b.strip()
+            )
         return cls(
-            data_dir=path("data-dir"),
-            ace_project_root=path("ace-project-root"),
+            data_dir=path(nc.get("data-dir")),
+            model_root=path(_legacy_root(nc)),
+            allowed_backends=allowed,
             epsilon_budget=float(nc["epsilon-budget"]) if "epsilon-budget" in nc else None,
             min_noise_multiplier=float(nc.get("min-noise-multiplier", 0.0)),
             max_delta=float(nc.get("max-dp-delta", 1.0)),
@@ -181,6 +205,21 @@ class LocalPolicy:
         )
 
     def effective_model(self, run: ModelSpec) -> ModelSpec:
-        if self.ace_project_root is None:
+        """The operator's model choice, if this client allows it, with local paths.
+
+        Checked before any backend code is imported: the run config comes from the
+        operator, and naming a backend means choosing code that runs next to this
+        client's data.
+        """
+        if run.backend not in self.allowed_backends:
+            raise BackendNotAllowedError(
+                f"model backend {run.backend!r} is not in this client's allowed-backends "
+                f"({', '.join(sorted(self.allowed_backends)) or 'none'})"
+            )
+        if self.model_root is None:
             return run
-        return replace(run, ace_project_root=self.ace_project_root)
+        return replace(run, root=self.model_root)
+
+
+class BackendNotAllowedError(PermissionError):
+    """The operator asked for a model backend the client has not allowed."""

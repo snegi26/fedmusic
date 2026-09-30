@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
-from conftest import DIM, ROOT, Toy
+from conftest import DIM, ROOT, Toy, make_songs
 from peft import PeftModel
 
 from fedlora_music import trainer
@@ -20,7 +21,7 @@ from fedlora_music.adapters import (
     inject_dual_lora,
     only_adapters,
 )
-from fedlora_music.config import AdapterSpec
+from fedlora_music.config import AdapterSpec, ModelSpec
 from fedlora_music.evaluate import (
     DEFAULT_PROMPTS,
     VARIANTS,
@@ -29,7 +30,7 @@ from fedlora_music.evaluate import (
     score_variant,
     variant_states,
 )
-from fedlora_music.model import Runtime
+from fedlora_music.store import ClientStore
 
 SPEC = AdapterSpec(("q_proj", "o_proj"), 4, 8, 2, 2, 0.0, True)
 
@@ -48,7 +49,7 @@ def _trained_toy() -> tuple[torch.nn.Module, torch.nn.Module]:
 
 @pytest.mark.parametrize("variant", list(VARIANTS))
 def test_exported_variant_matches_live_adapter_switch(variant: str, tmp_path: Path) -> None:
-    """What ACE-Step generates with for a variant == what the held-out loss measured."""
+    """What the backend generates with for a variant == what the held-out loss measured."""
     model, pristine = _trained_toy()
     x = torch.randn(3, DIM)
     with torch.no_grad(), only_adapters(model, VARIANTS[variant]):
@@ -73,21 +74,38 @@ def test_only_adapters_keeps_shared_a_frozen() -> None:
     assert {n: p.requires_grad for n, p in model.named_parameters()} == before
 
 
-def test_heldout_loss_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
-    def noisy_loss(rt: Runtime, batch: dict[str, torch.Tensor], cfg_ratio: float) -> torch.Tensor:
-        assert cfg_ratio == 0.0
-        noise = torch.randn_like(batch["x"])
-        return torch.nn.functional.mse_loss(rt.model.decoder.base_model(batch["x"] + noise), noise)
+def _toy_client(tmp_path: Path) -> tuple[Path, ModelSpec]:
+    """A client folder on the toy backend with trained-looking adapters and held-out data."""
+    from fedlora_music import prepare
+    from fedlora_music.model import get_runtime
 
-    monkeypatch.setattr(trainer, "flow_matching_loss", noisy_loss)
-    model, _ = _trained_toy()
-    rt = Runtime(model, torch.device("cpu"), torch.float32, -0.4, 1.0, 0.0)
-    batches = [{"x": torch.randn(4, DIM)} for _ in range(3)]
+    spec = replace(load_app_config(ROOT).model, backend="toy", root=None, variant="")
+    rt = get_runtime(spec)
+    with torch.no_grad():
+        for n, p in rt.model.named_parameters():
+            if ".lora_B." in n:
+                p.normal_(0, 0.1)
+    client = ClientStore(tmp_path / "client")
+    local = client.model("toy/tiny")
+    local.save_tensors(local.local_global_path, adapter_state(rt.model, GLOBAL))
+    local.save_tensors(local.personal_adapter_path, adapter_state(rt.model, PERSONAL))
+    songs = make_songs(tmp_path / "heldout")
+    assert prepare.main(["--audio-dir", str(songs), "--client-dir", str(client.root),
+                         "--model-backend", "toy", "--split", "eval"]) == 0  # fmt: skip
+    return client.root, spec
 
+
+def test_heldout_loss_is_deterministic(tmp_path: Path) -> None:
+    from fedlora_music.model import get_runtime
+
+    _, spec = _toy_client(tmp_path)
+    rt = get_runtime(spec)
+    batches = [{"x": torch.randn(4, 16), "y": torch.randn(4, 16)} for _ in range(3)]
     first = trainer.heldout_loss(rt, batches, seed=7)
     torch.manual_seed(123)  # unrelated RNG use in between must not matter
     assert trainer.heldout_loss(rt, batches, seed=7) == first
-    with only_adapters(model, ()):
+    assert trainer.heldout_loss(rt, batches, seed=8) != first  # the toy loss has a noise term
+    with only_adapters(rt.model, ()):
         assert trainer.heldout_loss(rt, batches, seed=7) != first
 
 
@@ -119,35 +137,37 @@ def test_load_app_config_reads_run_config() -> None:
     assert cfg.privacy.delta == pytest.approx(1e-5)
 
 
-def test_cli_writes_local_report(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Held-out loss only: adapters from the client's state, sources from `fedlora-prepare`."""
+def test_cli_heldout_loss_on_toy_backend(tmp_path: Path) -> None:
+    """Real held-out losses through the backend; adapters change the result."""
     from fedlora_music import evaluate
-    from fedlora_music.store import ClientStore
 
-    model, _ = _trained_toy()
-    store = ClientStore(tmp_path / "client")
-    store.save_tensors(store.local_global_path, adapter_state(model, GLOBAL))
-    store.save_tensors(store.personal_adapter_path, adapter_state(model, PERSONAL))
-    store.eval_tensor_dir.mkdir(parents=True)
-    store.record_source("eval", tmp_path / "heldout")
-    assert store.load_sources() == {"eval": str(tmp_path / "heldout")}
-
-    seen = {}
-
-    def fake_losses(spec, store_, states, variants, seed):
-        seen["root"] = spec.ace_project_root
-        return {v: float(i) for i, v in enumerate(variants)}
-
-    monkeypatch.setattr(evaluate, "heldout_losses", fake_losses)
+    client, _ = _toy_client(tmp_path)
     out = tmp_path / "report"
     assert evaluate.main([
-        "--client-dir", str(store.root), "--ace-project-root", str(tmp_path / "ace"),
-        "--app-dir", str(ROOT), "--variants", "base,fused", "--skip-generation",
-        "--out-dir", str(out),
+        "--client-dir", str(client), "--model-backend", "toy", "--app-dir", str(ROOT),
+        "--skip-generation", "--out-dir", str(out),
     ]) == 0  # fmt: skip
     report = json.loads((out / "report.json").read_text())
-    assert report["variants"] == {"base": {"heldout_loss": 0.0}, "fused": {"heldout_loss": 1.0}}
-    assert seen["root"] == (tmp_path / "ace").resolve()
+    assert report["model"] == "toy/tiny"
+    losses = {v: r["heldout_loss"] for v, r in report["variants"].items()}
+    assert losses.keys() == VARIANTS.keys()
+    assert len(set(losses.values())) == 4  # each adapter combination is a different model
+
+
+def test_generate_variants_exports_and_loads_each_adapter(tmp_path: Path) -> None:
+    from fedlora_music import evaluate
+    from fedlora_music.backends import get_backend
+
+    client, spec = _toy_client(tmp_path)
+    local = ClientStore(client).model("toy/tiny")
+    states = evaluate._load_adapters(local)
+    clips = evaluate.generate_variants(
+        get_backend(spec), states, ["base", "fused"], ["a prompt"], 2, 0.05, 0, tmp_path / "gen"
+    )
+    assert [len(c) for c in clips.values()] == [2, 2]
+    base, fused = (p.read_bytes() for p in (clips["base"][0][0], clips["fused"][0][0]))
+    assert base != fused  # the exported adapter really changes the output
+    assert (tmp_path / "gen" / "adapters" / "fused" / "adapter_config.json").is_file()
 
 
 def test_cli_rejects_unknown_variant(tmp_path: Path) -> None:
@@ -155,6 +175,6 @@ def test_cli_rejects_unknown_variant(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit):
         evaluate.main([
-            "--client-dir", str(tmp_path), "--ace-project-root", str(tmp_path),
+            "--client-dir", str(tmp_path), "--model-root", str(tmp_path),
             "--variants", "nope",
         ])  # fmt: skip

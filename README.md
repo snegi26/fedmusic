@@ -1,6 +1,6 @@
 # fedlora-music
 
-Federated LoRA personalization of **ACE-Step 1.5** (open-weight, MIT) with **Flower**. Each client learns its own musical style; no audio, latents, captions, sample counts, losses, or personal weights ever leave the client.
+Federated LoRA personalization of music models with **Flower**, on **ACE-Step 1.5** (open-weight, MIT) by default. Each client learns its own musical style; no audio, latents, captions, sample counts, losses, or personal weights ever leave the client. The base model is pluggable (see [Model backends](#model-backends)).
 
 ## How it works
 
@@ -13,10 +13,11 @@ Federated LoRA personalization of **ACE-Step 1.5** (open-weight, MIT) with **Flo
 
 | Piece | Where it lives | Leaves the client? |
 |---|---|---|
-| Raw audio → ACE-Step tensors (`fedlora-prepare`) | `clients/client-<id>/tensors/` | Never |
-| `personal` LoRA (r=8) – the client's style | `clients/client-<id>/state/` | Never |
+| Raw audio → model inputs (`fedlora-prepare`) | `<client>/models/<backend>/<variant>/tensors/` | Never |
+| `personal` LoRA (r=8) – the client's style | `<client>/models/<backend>/<variant>/state/` | Never |
 | `global` LoRA (r=16) – shared musical prior | server + clients | Only as a clipped, noised update |
-| Fused adapter for generation | `clients/client-<id>/export/fused_adapter/` | Never |
+| Fused adapter for generation | `<client>/models/<backend>/<variant>/export/fused_adapter/` | Never |
+| Privacy ledger (ε spent, all models) | `<client>/state/privacy_ledger.json` | Never |
 
 Design choices:
 
@@ -25,7 +26,8 @@ Design choices:
 - **Client-side DP**: each client clips its global update to `dp-clip-norm` and adds Gaussian noise before sending, so the guarantee does not depend on trusting the server. Privacy unit = the client's entire dataset (sensitivity 2C). RDP accounting is kept on the client; once `dp-epsilon-budget` would be exceeded the client refuses to participate.
 - **Uniform aggregation weights**: sample counts are never sent.
 - **Exact fusion for inference**: `s_g·B_g·A_g + s_p·B_p·A_p` is rewritten as one rank-24 PEFT adapter, which ACE-Step's `AceStepHandler.load_lora` loads unchanged.
-- The training step reuses ACE-Step's corrected trainer (`training_v2`): logit-normal timesteps from the model config, CFG dropout, flow-matching MSE.
+- The ACE-Step training step reuses ACE-Step's corrected trainer (`training_v2`): logit-normal timesteps from the model config, CFG dropout, flow-matching MSE.
+- **Model backends**: everything model-specific (loading, data preparation, loss, generation) sits behind one interface; the federation, DP and adapter math don't change per model. The server sends a fingerprint of its base weights, and clients with different weights refuse to train rather than corrupt the average.
 
 ## Setup
 
@@ -42,7 +44,7 @@ package does not list torch and is installed into ACE-Step's virtualenv instead.
 
 ### 1. Install ACE-Step 1.5
 
-Clone it **next to** this repository, so the default `ace-project-root = "../ACE-Step-1.5"` works:
+Clone it **next to** this repository, so the default `model-root = "../ACE-Step-1.5"` works:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh     # installs uv (macOS / Linux)
@@ -68,7 +70,7 @@ fedlora-music looks for them:
 ls checkpoints/acestep-v15-turbo/config.json checkpoints/vae
 ```
 
-fedlora-music always reads `<ace-project-root>/checkpoints`. If you set
+fedlora-music always reads `<model-root>/checkpoints`. If you set
 `ACESTEP_CHECKPOINTS_DIR` to share checkpoints between installs, symlink that folder to
 `ACE-Step-1.5/checkpoints`. To use another DiT variant, download it
 (`uv run acestep-download --model acestep-v15-sft`) and set `model-variant` to its folder name.
@@ -90,28 +92,32 @@ Run all `fedlora-*` and `flwr` commands below with this environment active.
 
 ### 4. Point the app at ACE-Step
 
-If ACE-Step is not at `../ACE-Step-1.5`, set `ace-project-root` in `pyproject.toml`
+If ACE-Step is not at `../ACE-Step-1.5`, set `model-root` in `pyproject.toml`
 (simulation) or in each client's `node_config.toml` (deployment). An absolute path is
-the safest choice.
+the safest choice. The `fedlora-*` commands take `--model-root`, or read
+`$FEDLORA_MODEL_ROOT`. The old names (`ace-project-root`, `--ace-project-root`) still
+work in node configs and on the command line.
 
 ## Run in simulation (one machine)
 
 1. **Each client prepares its own data locally** (a few songs are enough):
    ```bash
-   fedlora-prepare --audio-dir ~/songs/alice --client-dir clients/client-0 --ace-project-root ../ACE-Step-1.5
-   fedlora-prepare --audio-dir ~/songs/bob   --client-dir clients/client-1 --ace-project-root ../ACE-Step-1.5
+   fedlora-prepare --audio-dir ~/songs/alice --client-dir clients/client-0 --model-root ../ACE-Step-1.5
+   fedlora-prepare --audio-dir ~/songs/bob   --client-dir clients/client-1 --model-root ../ACE-Step-1.5
    ```
    Add `--dataset-json` (ACE-Step format) for real captions; otherwise filenames become captions.
 
 2. **Simulate the federation.** Copy the connection from `flwr-config.example.toml` into `~/.flwr/config.toml`, set `num-supernodes` to the number of client folders, then:
    ```bash
+   env/local-superlink.sh start   # once; see below
    flwr run . fedlora-sim --stream
    flwr run . fedlora-sim --run-config "num-server-rounds=20 dp-noise-multiplier=2.0" --stream
    ```
+   `env/local-superlink.sh start` matters with ACE-Step. Flower 1.39's own local SuperLink runs `uv sync` into a fresh environment for every run: that downloads a second torch (peft depends on it) from PyPI, which then shadows ACE-Step's pinned CUDA build. The script starts a SuperLink with runtime installs disabled, and `flwr run` reuses it.
 
 3. **Generate in the client's style**, on the client:
    ```bash
-   fedlora-generate --client-dir clients/client-0 --ace-project-root ../ACE-Step-1.5 \
+   fedlora-generate --client-dir clients/client-0 --model-root ../ACE-Step-1.5 \
        --caption "warm lo-fi hip hop, dusty drums, rhodes" --duration 60
    ```
 
@@ -123,13 +129,16 @@ Each client runs its own SuperNode on its own machine, with its own data folder 
 
 ```toml
 data-dir = "/Users/alice/Library/Application Support/FedLoRA Music/client"
-ace-project-root = "/Users/alice/ACE-Step-1.5"
+model-root = "/Users/alice/ACE-Step-1.5"
+allowed-backends = "acestep" # the only model code this client will run
 epsilon-budget = 10.0        # client never spends more than this in total
 min-noise-multiplier = 1.0   # client never accepts less noise than this
 max-dp-delta = 1e-5
 ```
 
 For each setting, the ClientApp takes whichever of the operator's and the client's values is stricter (more noise, smaller budget, smaller δ). The operator can tighten privacy but never loosen it. The ledger records the noise level of every round, so accounting stays exact if the operator changes σ between runs.
+
+The operator picks the model (`model-backend` in the run config), but a client only runs backends listed in its `allowed-backends` (default: the built-in `acestep` and `toy`), checked before any backend code is imported. Installed plugin backends never run unless listed.
 
 **Operator**
 
@@ -147,11 +156,13 @@ Give each client the CA certificate (`ca.crt`) and the SuperLink address (port 9
 
 ```bash
 python -m fedlora_music.identity --out-dir <data-dir>/keys   # send the printed .pub to the operator
-fedlora-prepare --audio-dir ~/songs --client-dir <data-dir> --ace-project-root ~/ACE-Step-1.5
+fedlora-prepare --audio-dir ~/songs --client-dir <data-dir> --model-root ~/ACE-Step-1.5
 flower-supernode --superlink fl.example.org:9092 --root-certificates ca.crt \
     --auth-supernode-private-key <data-dir>/keys/supernode_key \
     --node-config <data-dir>/node_config.toml --host 127.0.0.1 --port 9094
 ```
+
+`flower-supernode` does not install an app's Python dependencies unless started with `--allow-runtime-dependency-installation`. Keep it that way: otherwise the operator's bundle decides which packages get installed on your machine.
 
 **Trust in the app code.** In Flower deployment, the ClientApp code comes from the app bundle (FAB) of whoever submits the run. The privacy guarantees above hold only if that code is the audited version from this repository. Modified code runs with access to your data folder. Before joining, do one of:
 - run your own SuperLink, or join only operators you trust to submit this exact app; or
@@ -180,7 +191,7 @@ For distribution, sign with a Developer ID (`briefcase package macOS -i "Develop
 
 ## Tuning privacy vs. utility
 
-`<data-dir>/state/train_log.jsonl` records `pre_clip_norm`, σ and ε per round. Set `dp-clip-norm` near its median. Reference ε (δ=1e-5) per client:
+`<data-dir>/models/<backend>/<variant>/state/train_log.jsonl` records `pre_clip_norm`, σ and ε per round. Set `dp-clip-norm` near its median. Reference ε (δ=1e-5) per client:
 
 | σ | 1 round | 10 rounds | 20 rounds |
 |---|---|---|---|
@@ -205,13 +216,13 @@ few songs out of training and prepare them as a held-out split:
 
 ```bash
 fedlora-prepare --audio-dir ~/songs/alice-heldout --split eval \
-    --client-dir clients/client-0 --ace-project-root ../ACE-Step-1.5
+    --client-dir clients/client-0 --model-root ../ACE-Step-1.5
 ```
 
 After at least one federated round:
 
 ```bash
-fedlora-eval --client-dir clients/client-0 --ace-project-root ../ACE-Step-1.5
+fedlora-eval --client-dir clients/client-0 --model-root ../ACE-Step-1.5
 fedlora-eval ... --prompts my_prompts.txt --samples-per-prompt 4 --aesthetics
 ```
 
@@ -229,7 +240,7 @@ It compares four variants: `base` (no adapter), `global`, `personal` and `fused`
 | `copy` | Similarity of each generation to its nearest training song, and the share above `--copy-threshold` (0.95) | lower |
 | `aesthetics` | Meta Audiobox Aesthetics (CE, CU, PC, PQ), with `--aesthetics` and `pip install -e ".[eval-aesthetics]"` | higher |
 
-Everything stays in `<client-dir>/eval/runs/<timestamp>/` (`report.json`,
+Everything stays in `<client-dir>/models/<backend>/<variant>/eval/runs/<timestamp>/` (`report.json`,
 `embeddings.safetensors`, the generated audio); nothing is sent to the server. The
 held-out and training song folders default to what `fedlora-prepare` recorded in
 `<client-dir>/sources.json`. Prompts come from `--prompts` (one per line), else the
@@ -252,7 +263,7 @@ fedlora-fma-partition --metadata-dir fma_metadata --audio-dir fma_small \
     --out-dir ../fedlora-bench --num-clients 4 --group-by genre --tracks-per-client 40
 
 # 3. Prepare, train one simulation per noise level, evaluate, report.
-fedlora-benchmark --bench-dir ../fedlora-bench --ace-project-root ../ACE-Step-1.5 \
+fedlora-benchmark --bench-dir ../fedlora-bench --model-root ../ACE-Step-1.5 \
     --sigmas 1,2,4,8 --rounds 10
 ```
 
@@ -273,6 +284,62 @@ Cost: each σ is a full federated training run, and evaluation generates
 `prompts × samples-per-prompt` clips per variant per client. Start with 2 clients,
 `--tracks-per-client 10`, `--rounds 3` and one σ to check the pipeline.
 
+## Model backends
+
+The harness is model-agnostic. A backend (`fedlora_music/backends/`) supplies only
+what depends on the model; the federation, DP, client policy, adapter fusion and
+evaluation metrics are shared.
+
+| Backend | Model | Weights license | Use |
+|---|---|---|---|
+| `acestep` (default) | ACE-Step 1.5 DiT, variants under `<model-root>/checkpoints` | MIT | real training and generation |
+| `toy` | 2-block MLP, "audio" is a sine tone | n/a | tests, CI, VMs: the whole pipeline on CPU in seconds |
+
+Select one with `model-backend` (run config) or `--model-backend` (CLIs). Switching
+models starts a new federation: adapters only fit the base weights they were trained
+on, which is why the server's model fingerprint must match every client's. Each
+client prepares its data again per model (inputs are model-specific), but the privacy
+ledger is shared: ε measures what was revealed about the client's songs, whatever the
+model, so it never resets.
+
+Held-out loss is only comparable within one backend (models train on different
+objectives). Compare models with the CLAP-based metrics, which don't depend on the
+model under test.
+
+**Adding a backend.** Subclass `fedlora_music.backends.ModelBackend` (load the model,
+prepare data, loss, generator, fingerprint; see `backends/toy.py` for a complete
+small example) and register it as an entry point:
+
+```toml
+[project.entry-points."fedlora_music.backends"]
+mymodel = "my_package.backend:MyBackend"
+```
+
+Clients run it only after adding it to their `allowed-backends`. Check the weights'
+license before deploying: some music models' weights are non-commercial.
+
+**Upgrading a data folder from before backends.** Model files moved under
+`models/acestep/acestep-v15-turbo/`; the ledger stayed at `state/privacy_ledger.json`:
+
+```bash
+cd <data-dir> && m=models/acestep/acestep-v15-turbo && mkdir -p $m/state
+mv tensors export eval $m/ 2>/dev/null
+mv state/personal_adapter.safetensors state/global_adapter_local.safetensors state/train_log.jsonl $m/state/
+```
+
+## Local environments
+
+`env/` holds three self-contained ways to run this repository, all provisioned by
+the same script (`env/provision.sh`) and checked by the same test (`env/smoke.sh`:
+lint, tests, a 2-client Flower federation, evaluation and generation on the toy
+backend). See [env/README.md](env/README.md).
+
+| | Host | GPU | Isolation |
+|---|---|---|---|
+| [Lima VM](env/README.md#1-lima-vm-macos) | macOS (or Linux) | none (Apple GPUs can't be passed to a Linux VM) | full VM |
+| [gVisor sandbox](env/README.md#2-gvisor-sandbox-linux--nvidia) | Linux | shared with the host (nvproxy) | user-space kernel |
+| [Cloud Hypervisor microVM](env/README.md#3-cloud-hypervisor-microvm-linux--spare-nvidia-gpu) | Linux + KVM | a whole GPU, passed through (VFIO) | hardware VM |
+
 ## Tests
 
 ```bash
@@ -282,7 +349,8 @@ pytest --cov     # with coverage
 ruff check . && ruff format --check .
 ```
 
-The tests use a small stand-in model, so they need neither ACE-Step nor a GPU. Outside
+The tests run on the `toy` backend, so they need neither ACE-Step nor a GPU.
+`env/smoke.sh` adds a real federated simulation, evaluation and generation (under a minute). Outside
 ACE-Step's environment, install a CPU torch first:
 `pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -e ".[dev]"`.
 CI (`.github/workflows/ci.yml`) runs lint and tests on Python 3.11 and 3.12.

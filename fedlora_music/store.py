@@ -1,4 +1,20 @@
-"""Client-local storage. Everything under a client's directory stays on that client."""
+"""Client-local storage. Everything under a client's directory stays on that client.
+
+Layout of a client's data folder::
+
+    state/privacy_ledger.json         privacy spent on this client's songs (all models)
+    sources.json                      which song folders fed each split (all models)
+    models/<backend>/<variant>/       everything tied to one base model:
+        tensors/                      training inputs from ``fedlora-prepare``
+        eval/tensors/                 held-out inputs (``--split eval``)
+        eval/runs/                    ``fedlora-eval`` reports
+        state/                        personal adapter, local global adapter, train log
+        export/fused_adapter/         the client's generation adapter
+
+The ledger is deliberately outside ``models/``: epsilon measures what has been
+revealed about the client's songs, whatever model was trained on them, so switching
+models must never reset it.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +31,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ClientStore:
+    """Model-independent client state."""
+
     root: Path
 
     @classmethod
@@ -34,45 +52,13 @@ class ClientStore:
             "node config must set `data-dir` (deployment) or `partition-id` (simulation)"
         )
 
-    @property
-    def tensor_dir(self) -> Path:
-        """ACE-Step preprocessed ``.pt`` tensors produced locally by ``fedlora-prepare``."""
-        return self.root / "tensors"
-
-    @property
-    def state_dir(self) -> Path:
-        return self.root / "state"
-
-    @property
-    def personal_adapter_path(self) -> Path:
-        return self.state_dir / "personal_adapter.safetensors"
-
-    @property
-    def local_global_path(self) -> Path:
-        return self.state_dir / "global_adapter_local.safetensors"
+    def model(self, key: str) -> ModelStore:
+        """Storage for one base model; ``key`` is ``<backend>/<variant>``."""
+        return ModelStore(self.root / "models" / key)
 
     @property
     def ledger_path(self) -> Path:
-        return self.state_dir / "privacy_ledger.json"
-
-    @property
-    def fused_adapter_dir(self) -> Path:
-        """Ready-to-load PEFT adapter = latest global + personal (the client's model)."""
-        return self.root / "export" / "fused_adapter"
-
-    @property
-    def log_path(self) -> Path:
-        return self.state_dir / "train_log.jsonl"
-
-    @property
-    def eval_dir(self) -> Path:
-        """Held-out data and evaluation reports. Never used for training, never sent."""
-        return self.root / "eval"
-
-    @property
-    def eval_tensor_dir(self) -> Path:
-        """Held-out tensors from ``fedlora-prepare --split eval``."""
-        return self.eval_dir / "tensors"
+        return self.root / "state" / "privacy_ledger.json"
 
     @property
     def sources_path(self) -> Path:
@@ -88,6 +74,49 @@ class ClientStore:
         sources = {**self.load_sources(), split: str(audio_dir)}
         self.root.mkdir(parents=True, exist_ok=True)
         self.sources_path.write_text(json.dumps(sources, indent=2), encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class ModelStore:
+    """State for one base model. Adapters only fit the model they were trained on."""
+
+    root: Path
+
+    @property
+    def tensor_dir(self) -> Path:
+        """Backend-specific training inputs produced locally by ``fedlora-prepare``."""
+        return self.root / "tensors"
+
+    @property
+    def state_dir(self) -> Path:
+        return self.root / "state"
+
+    @property
+    def personal_adapter_path(self) -> Path:
+        return self.state_dir / "personal_adapter.safetensors"
+
+    @property
+    def local_global_path(self) -> Path:
+        return self.state_dir / "global_adapter_local.safetensors"
+
+    @property
+    def fused_adapter_dir(self) -> Path:
+        """Ready-to-load adapter = latest global + personal (the client's model)."""
+        return self.root / "export" / "fused_adapter"
+
+    @property
+    def log_path(self) -> Path:
+        return self.state_dir / "train_log.jsonl"
+
+    @property
+    def eval_dir(self) -> Path:
+        """Held-out data and evaluation reports. Never used for training, never sent."""
+        return self.root / "eval"
+
+    @property
+    def eval_tensor_dir(self) -> Path:
+        """Held-out inputs from ``fedlora-prepare --split eval``."""
+        return self.eval_dir / "tensors"
 
     def load_tensors(self, path: Path) -> dict[str, torch.Tensor] | None:
         from safetensors.torch import load_file

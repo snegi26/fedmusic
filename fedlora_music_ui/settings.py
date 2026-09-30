@@ -8,10 +8,14 @@ import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+# The app bundle ships only this package, not ``fedlora_music``, so these mirror
+# ``fedlora_music.backends`` defaults and the ``ClientStore`` layout.
+DEFAULT_VARIANTS = {"acestep": "acestep-v15-turbo", "toy": "tiny"}
+
 
 @dataclass
 class Settings:
-    ace_project_root: str = ""
+    ace_project_root: str = ""  # the model backend's install folder (ACE-Step checkout)
     python: str = ""  # runtime interpreter; blank -> <ace>/.venv/bin/python
     songs_dir: str = ""
     data_dir: str = ""
@@ -21,7 +25,8 @@ class Settings:
     epsilon_budget: float = 10.0
     min_noise_multiplier: float = 1.0
     max_dp_delta: float = 1e-5
-    model_variant: str = "acestep-v15-turbo"
+    model_backend: str = "acestep"
+    model_variant: str = ""  # blank -> the backend's default
     runtime_port: int = 9094
 
     # -- persistence ---------------------------------------------------------
@@ -71,8 +76,24 @@ class Settings:
         return self.data / "node_config.toml"
 
     @property
+    def variant(self) -> str:
+        return self.model_variant or DEFAULT_VARIANTS.get(self.model_backend, "")
+
+    @property
+    def model_dir(self) -> Path:
+        """Everything tied to the chosen base model (see ``ClientStore.model``)."""
+        return self.data / "models" / self.model_backend / self.variant
+
+    @property
     def fused_adapter_dir(self) -> Path:
-        return self.data / "export" / "fused_adapter"
+        return self.model_dir / "export" / "fused_adapter"
+
+    def model_args(self) -> list[str]:
+        return [
+            "--model-backend", self.model_backend,
+            "--model-root", str(self.ace_root),
+            "--model-variant", self.variant,
+        ]  # fmt: skip
 
     # -- validation ----------------------------------------------------------
     def problems(self, action: str) -> list[str]:
@@ -80,7 +101,8 @@ class Settings:
         out: list[str] = []
         if not self.data_dir:
             out.append("Choose a data folder.")
-        if action != "identity" and not (self.ace_root / "checkpoints").is_dir():
+        needs_model = action != "identity" and self.model_backend == "acestep"
+        if needs_model and not (self.ace_root / "checkpoints").is_dir():
             out.append("ACE-Step folder must contain 'checkpoints' (run acestep-download).")
         if not self.runtime_python.is_file():
             out.append(f"Python runtime not found at {self.runtime_python}.")
@@ -89,7 +111,7 @@ class Settings:
         if action == "join":
             if not self.supernode_exe.is_file():
                 out.append(f"flower-supernode not found next to {self.runtime_python}.")
-            if not (self.data / "tensors").is_dir():
+            if not (self.model_dir / "tensors").is_dir():
                 out.append("Prepare your songs first.")
             if not self.insecure:
                 if not Path(self.ca_cert).expanduser().is_file():
@@ -118,7 +140,9 @@ def write_node_config(s: Settings) -> Path:
     """Client-owned policy handed to the ClientApp via ``--node-config <file>.toml``."""
     lines = [
         f"data-dir = {_toml_str(str(s.data.resolve()))}",
-        f"ace-project-root = {_toml_str(str(s.ace_root.resolve()))}",
+        f"model-root = {_toml_str(str(s.ace_root.resolve()))}",
+        # Run only the model this client set up, whatever the operator asks for.
+        f"allowed-backends = {_toml_str(s.model_backend)}",
         f"epsilon-budget = {float(s.epsilon_budget)!r}",
         f"min-noise-multiplier = {float(s.min_noise_multiplier)!r}",
         f"max-dp-delta = {float(s.max_dp_delta)!r}",
@@ -133,8 +157,7 @@ def prepare_cmd(s: Settings) -> list[str]:
         str(s.runtime_python), "-m", "fedlora_music.prepare",
         "--audio-dir", str(Path(s.songs_dir).expanduser()),
         "--client-dir", str(s.data),
-        "--ace-project-root", str(s.ace_root),
-        "--model-variant", s.model_variant,
+        *s.model_args(),
     ]  # fmt: skip
 
 
@@ -161,8 +184,7 @@ def generate_cmd(s: Settings, caption: str, duration: float) -> list[str]:
     return [
         str(s.runtime_python), "-m", "fedlora_music.generate",
         "--client-dir", str(s.data),
-        "--ace-project-root", str(s.ace_root),
-        "--model-variant", s.model_variant,
+        *s.model_args(),
         "--caption", caption,
         "--duration", str(duration),
     ]  # fmt: skip
@@ -176,16 +198,24 @@ class Status:
 
 
 def read_status(s: Settings) -> Status:
-    """Read local progress files only (no torch import)."""
+    """Read local progress files only (no torch import).
+
+    Rounds and epsilon cover every model this client has trained (the privacy ledger
+    is shared); the loss is the chosen model's.
+    """
     ledger = s.data / "state" / "privacy_ledger.json"
-    log = s.data / "state" / "train_log.jsonl"
     rounds = len(json.loads(ledger.read_text())["noise_multipliers"]) if ledger.is_file() else 0
-    epsilon, loss = 0.0, None
-    if log.is_file():
-        lines = log.read_text().strip().splitlines()
-        if lines:
-            last = json.loads(lines[-1])
-            epsilon, loss = float(last.get("epsilon", 0.0)), last.get("loss")
+
+    def last_record(log: Path) -> dict:
+        lines = log.read_text().strip().splitlines() if log.is_file() else []
+        return json.loads(lines[-1]) if lines else {}
+
+    latest = [last_record(p) for p in (s.data / "models").glob("*/*/state/train_log.jsonl")]
+    latest = [r for r in latest if r]
+    epsilon = (
+        float(max(latest, key=lambda r: r.get("ts", 0.0)).get("epsilon", 0.0)) if latest else 0.0
+    )
+    loss = last_record(s.model_dir / "state" / "train_log.jsonl").get("loss")
     return Status(rounds=rounds, epsilon=epsilon, last_loss=loss)
 
 

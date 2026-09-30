@@ -12,8 +12,9 @@ stay in the client's data folder (node config ``data-dir`` in deployment,
 ``<clients-root>/client-<partition-id>`` in simulation).
 
 Privacy parameters are the stricter of the operator's run config and the client's
-own node config (see ``LocalPolicy``), and the budget check happens before any
-data is read.
+own node config (see ``LocalPolicy``). Before any data is read, the client also
+refuses a model backend its node config does not allow, a model whose weights do
+not match the server's fingerprint, and a round that would exceed its budget.
 """
 
 from __future__ import annotations
@@ -34,16 +35,20 @@ from fedlora_music.adapters import (
     reset_adapter,
     trainable_names,
 )
-from fedlora_music.config import FedLoRAConfig, LocalPolicy
+from fedlora_music.backends import get_backend
+from fedlora_music.config import BackendNotAllowedError, FedLoRAConfig, LocalPolicy
 from fedlora_music.model import get_runtime
 from fedlora_music.privacy import PrivacyLedger, privatize_update
 from fedlora_music.store import ClientStore
-from fedlora_music.trainer import build_loader, train_local
+from fedlora_music.trainer import train_local
 
 logger = logging.getLogger(__name__)
 
 ERR_BUDGET_EXHAUSTED = 4001
+ERR_BACKEND_NOT_ALLOWED = 4002
+ERR_MODEL_MISMATCH = 4003
 DP_WEIGHT_KEY = "dp-weight"
+FINGERPRINT_KEY = "model-fingerprint"
 
 app = ClientApp()
 
@@ -55,27 +60,43 @@ def train(msg: Message, context: Context) -> Message:
     privacy = policy.effective_privacy(cfg.privacy)
     store = ClientStore.resolve(policy.data_dir, cfg.clients_root, context.node_config)
 
-    # 1. Refuse before touching data if this round would exceed the local budget.
+    # 1. Refuse before touching data: a backend this client does not allow (checked
+    #    before its code is imported), or a round that would exceed the local budget.
+    try:
+        spec = policy.effective_model(cfg.model)
+    except BackendNotAllowedError as exc:
+        logger.warning("%s: %s", store.root, exc)
+        return Message(Error(ERR_BACKEND_NOT_ALLOWED, str(exc)), reply_to=msg)
     ledger = PrivacyLedger.load(store.ledger_path)
     eps_next = ledger.epsilon(privacy.delta, extra=privacy.noise_multiplier)
     if eps_next > privacy.epsilon_budget:
         logger.warning("%s: privacy budget exhausted (eps would be %.2f)", store.root, eps_next)
         return Message(Error(ERR_BUDGET_EXHAUSTED, "client privacy budget exhausted"), reply_to=msg)
 
-    rt = get_runtime(policy.effective_model(cfg.model))
+    # Adapters only fit the exact base weights they were trained on: averaging updates
+    # from a different model would silently corrupt the global adapter.
+    backend = get_backend(spec)
+    expected = msg.content["config"].get(FINGERPRINT_KEY)
+    if expected != backend.fingerprint():
+        reason = f"local {backend.key} weights do not match the server's model fingerprint"
+        logger.warning("%s: %s", store.root, reason)
+        return Message(Error(ERR_MODEL_MISMATCH, reason), reply_to=msg)
+
+    rt = get_runtime(spec)
     model = rt.model
+    local = store.model(backend.key)
 
     # 2. Install the received global adapter and this client's own personal adapter.
     received = msg.content["arrays"].to_torch_state_dict()
     load_adapter_state(model, GLOBAL, received)
-    personal = store.load_tensors(store.personal_adapter_path)
+    personal = local.load_tensors(local.personal_adapter_path)
     if personal is None:
         reset_adapter(model, PERSONAL, seed=secrets.randbits(63))
     else:
         load_adapter_state(model, PERSONAL, personal)
 
     # 3. Local training on local data only.
-    loader = build_loader(store.tensor_dir, cfg.train.batch_size)
+    loader = backend.build_loader(local.tensor_dir, cfg.train.batch_size)
     loss = train_local(rt, loader, cfg.train)
 
     # 4. Privatise the global update. Frozen coords (global A under FFA) are public
@@ -90,14 +111,18 @@ def train(msg: Message, context: Context) -> Message:
 
     # 5. Persist local state (never transmitted).
     trained_personal = adapter_state(model, PERSONAL)
-    store.save_tensors(store.personal_adapter_path, trained_personal)
-    store.save_tensors(store.local_global_path, trained_global)
+    local.save_tensors(local.personal_adapter_path, trained_personal)
+    local.save_tensors(local.local_global_path, trained_global)
     export_fused_adapter(
-        trained_global, trained_personal, cfg.model.adapters, store.fused_adapter_dir
+        trained_global,
+        trained_personal,
+        spec.adapters,
+        local.fused_adapter_dir,
+        root=backend.adapter_root,
     )
     ledger.record(privacy.noise_multiplier)
     ledger.save(store.ledger_path)
-    store.append_log(
+    local.append_log(
         {
             "round": int(msg.content["config"].get("server-round", -1)),
             "loss": loss,

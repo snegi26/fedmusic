@@ -1,8 +1,9 @@
-"""Shared toy model: a tiny stand-in for ACE-Step's DiT, so no checkpoints are needed."""
+"""Shared fixtures. Federated tests run on the built-in ``toy`` backend: no checkpoints."""
 
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,35 +26,35 @@ class Block(nn.Module):
 
 
 class Toy(nn.Module):
-    """Has a ``.decoder`` like ``AceStepConditionGenerationModel``."""
+    """Minimal model with a ``.decoder``, for adapter-level tests."""
 
     def __init__(self, d: int = DIM) -> None:
         super().__init__()
         self.decoder = nn.Sequential(Block(d), Block(d))
 
 
-def toy_loss(rt: Any, batch: dict[str, torch.Tensor], cfg_ratio: float) -> torch.Tensor:
-    """Replaces the flow-matching loss: regress ``y`` from ``x`` through the decoder."""
-    del cfg_ratio
-    return nn.functional.mse_loss(rt.model.decoder.base_model(batch["x"]), batch["y"])
+@pytest.fixture(autouse=True)
+def _fresh_caches() -> Iterator[None]:
+    """Model and backend caches are process-wide; keep tests independent."""
+    from fedlora_music.backends import get_backend
+    from fedlora_music.model import get_runtime
 
-
-@pytest.fixture
-def toy_batches() -> list[dict[str, torch.Tensor]]:
-    g = torch.Generator().manual_seed(0)
-    return [
-        {"x": torch.randn(4, DIM, generator=g), "y": torch.randn(4, DIM, generator=g)}
-        for _ in range(2)
-    ]
+    get_runtime.cache_clear()
+    get_backend.cache_clear()
+    yield
+    get_runtime.cache_clear()
+    get_backend.cache_clear()
 
 
 @pytest.fixture
 def run_config(tmp_path: Path) -> dict[str, Any]:
-    """The app's real run config, shrunk to the toy model and pointed at ``tmp_path``."""
+    """The app's real run config on the toy backend, pointed at ``tmp_path``."""
     rc = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["flwr"]["app"]["config"]
     return {
         **rc,
-        "target-modules": "q_proj,o_proj",
+        "model-backend": "toy",
+        "model-root": "",
+        "model-variant": "",
         "global-rank": 4,
         "global-alpha": 8,
         "personal-rank": 2,
@@ -63,5 +64,12 @@ def run_config(tmp_path: Path) -> dict[str, Any]:
         "lr-personal": 1e-2,
         "clients-root": str(tmp_path / "clients"),
         "server-output-dir": str(tmp_path / "server_out"),
-        "ace-project-root": str(tmp_path / "ace"),
     }
+
+
+def make_songs(folder: Path, n: int = 3) -> Path:
+    """Stand-in audio files; the toy backend hashes bytes and never decodes them."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        (folder / f"song{i}.wav").write_bytes(f"not really audio {i}".encode())
+    return folder

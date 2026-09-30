@@ -1,0 +1,156 @@
+# gVisor sandbox for fedlora-music on Linux (component 2 of env/README.md).
+#
+# Every service runs under gVisor (runsc): the code gets its own user-space kernel
+# instead of the host's, sees only the folders mounted below, has no Linux
+# capabilities and a read-only root filesystem. GPU services use the `runsc-gpu`
+# runtime (nvproxy) and share the host's NVIDIA GPU; nothing is dedicated to them.
+#
+# One-time host setup: sudo env/gvisor/install-host.sh
+# Then, from the repository root (paths below are relative to this file):
+#   docker compose -f env/gvisor/compose.yaml build dev acestep
+#   docker compose -f env/gvisor/compose.yaml run --rm smoke
+#
+# Host folders (override with environment variables):
+#   FEDMUSIC_DATA    this client's data folder: tensors, adapters, ledger, keys
+#   FEDMUSIC_SONGS   your songs (mounted read-only)
+#   FEDMUSIC_MODELS  ACE-Step checkpoints (read-only except for `download`)
+name: fedmusic
+
+x-sandbox: &sandbox
+  user: "${UID:-1000}:${GID:-1000}"
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  network_mode: none
+  runtime: runsc
+  environment: &env
+    HOME: /tmp
+    PYTHONDONTWRITEBYTECODE: "1"
+    FLWR_HOME: /data/.flwr
+    HF_HOME: /data/.cache/huggingface
+    FEDLORA_CACHE_DIR: /data/.cache/fedlora_music
+  volumes:
+    - ${FEDMUSIC_REPO:-../..}:/workspace:ro
+    - ${FEDMUSIC_DATA:-../../.fedmusic/data}:/data
+
+x-acestep: &acestep
+  <<: *sandbox
+  image: fedmusic:acestep
+  volumes:
+    - ${FEDMUSIC_REPO:-../..}:/workspace:ro
+    - ${FEDMUSIC_DATA:-../../.fedmusic/data}:/data
+    - ${FEDMUSIC_SONGS:-../../.fedmusic/songs}:/songs:ro
+    - ${FEDMUSIC_MODELS:-../../.fedmusic/models}:/models/checkpoints:ro
+
+x-gpu: &gpu
+  <<: *acestep
+  runtime: runsc-gpu
+  environment:
+    <<: *env
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  # -- images (build only) ----------------------------------------------------------
+  dev:
+    profiles: [build]
+    image: fedmusic:dev
+    build: &build
+      context: ../..
+      dockerfile: env/image/Containerfile
+      target: dev
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ubuntu:24.04}
+        TORCH_INDEX: ${TORCH_INDEX:-https://download.pytorch.org/whl/cpu}
+        APT_HTTPS: ${APT_HTTPS:-0}
+  acestep:
+    profiles: [build]
+    image: fedmusic:acestep
+    build:
+      <<: *build
+      target: acestep
+
+  # -- checks -----------------------------------------------------------------------
+  smoke:  # CPU sandbox, no network: lint, tests, toy federation, eval, generation
+    <<: *sandbox
+    image: fedmusic:dev
+    command: ["env/smoke.sh"]
+
+  gpu-check:  # the GPU is visible inside the sandbox
+    <<: *gpu
+    command:
+      - python
+      - -c
+      - "import torch; assert torch.cuda.is_available(), 'no CUDA in sandbox';
+        print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+  # -- client workflow (see README "Run in deployment") -------------------------------
+  download:  # ACE-Step checkpoints into FEDMUSIC_MODELS (network on, CPU)
+    <<: *acestep
+    network_mode: bridge
+    volumes:
+      - ${FEDMUSIC_DATA:-../../.fedmusic/data}:/data
+      - ${FEDMUSIC_MODELS:-../../.fedmusic/models}:/models/checkpoints
+    command: ["acestep-download", "--dir", "/models/checkpoints"]
+
+  identity:  # SuperNode key pair in /data/keys; send the printed public key
+    <<: *acestep
+    command: ["python", "-m", "fedlora_music.identity", "--out-dir", "/data/keys"]
+
+  prepare:  # your songs -> training inputs; SPLIT=eval for held-out songs
+    <<: *gpu
+    command:
+      - fedlora-prepare
+      - --audio-dir
+      - /songs/${SPLIT:-train}
+      - --client-dir
+      - /data/client
+      - --split
+      - ${SPLIT:-train}
+
+  supernode:  # join a federation: SUPERLINK=host:9092 (network on: connects out)
+    <<: *gpu
+    network_mode: bridge
+    environment:
+      <<: *env
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      SUPERLINK: ${SUPERLINK:-}
+    command:
+      - bash
+      - -c
+      - |
+        [ -n "$$SUPERLINK" ] || { echo "set SUPERLINK=host:9092" >&2; exit 2; }
+        exec flower-supernode --superlink "$$SUPERLINK" \
+          --root-certificates /data/keys/ca.crt \
+          --auth-supernode-private-key /data/keys/supernode_key \
+          --node-config /data/node_config.toml --host 127.0.0.1 --port 9094
+
+  evaluate:  # local report; network on for the one-time CLAP download
+    <<: *gpu
+    network_mode: bridge
+    command: ["fedlora-eval", "--client-dir", "/data/client", "--app-dir", "/workspace"]
+
+  generate:
+    <<: *gpu
+    command:
+      - fedlora-generate
+      - --client-dir
+      - /data/client
+      - --caption
+      - ${CAPTION:-warm lo-fi hip hop, dusty drums, rhodes}
+      - --out-dir
+      - /data/generated
+
+  shell:  # interactive, GPU, network on
+    <<: *gpu
+    network_mode: bridge
+    stdin_open: true
+    tty: true
+    command: ["bash"]

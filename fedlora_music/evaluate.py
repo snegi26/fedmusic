@@ -2,25 +2,27 @@
 
 Compares four variants of the model on the client's own held-out data:
 
-* ``base``      ACE-Step with no adapter
+* ``base``      the base model with no adapter
 * ``global``    the federated adapter only
 * ``personal``  the client's own adapter only
 * ``fused``     both (what ``fedlora-generate`` uses)
 
 Metrics per variant (see ``fedlora_music.metrics``):
 
-* held-out flow-matching loss on ``<client-dir>/eval/tensors`` (fixed noise and t)
+* held-out training loss (the backend's objective, fixed randomness); comparable
+  within one model only
 * style distance (KAD; FAD when there are enough clips) to the held-out songs
 * prompt adherence (CLAP audio-text similarity)
 * diversity (mean pairwise CLAP distance between generations)
 * copy screen (nearest training song by CLAP similarity)
 * optionally Audiobox Aesthetics scores (``--aesthetics``)
 
+The CLAP metrics are independent of the model under test, so they compare models.
 Held-out songs are prepared with ``fedlora-prepare --split eval``. Results go to
-``<client-dir>/eval/runs/<timestamp>/`` (``report.json``, ``embeddings.safetensors``,
-generated audio).
+``<client-dir>/models/<backend>/<variant>/eval/runs/<timestamp>/`` (``report.json``,
+``embeddings.safetensors``, generated audio).
 
-    fedlora-eval --client-dir ./clients/client-0 --ace-project-root ../ACE-Step-1.5
+    fedlora-eval --client-dir ./clients/client-0 --model-root ../ACE-Step-1.5
 """
 
 from __future__ import annotations
@@ -40,7 +42,9 @@ from typing import Any
 import torch
 
 from fedlora_music.adapters import GLOBAL, PERSONAL, StateDict, export_fused_adapter
-from fedlora_music.config import AdapterSpec, FedLoRAConfig, ModelSpec
+from fedlora_music.backends import ModelBackend, get_backend
+from fedlora_music.cli import add_model_args, model_spec
+from fedlora_music.config import FedLoRAConfig, ModelSpec
 from fedlora_music.metrics import (
     centroid_similarity,
     copy_check,
@@ -49,7 +53,7 @@ from fedlora_music.metrics import (
     pairwise_diversity,
     prompt_adherence,
 )
-from fedlora_music.store import ClientStore
+from fedlora_music.store import ClientStore, ModelStore
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +87,7 @@ def variant_states(
     """Adapter pair whose fusion equals running only the variant's adapters.
 
     Zeroing ``B`` removes an adapter's contribution exactly, so every non-base
-    variant can be exported as a standard fused PEFT adapter for ACE-Step.
+    variant can be exported as a standard fused PEFT adapter for generation.
     """
     active = VARIANTS[variant]
     if not active:
@@ -132,7 +136,7 @@ def score_variant(
     return out
 
 
-def _load_adapters(store: ClientStore) -> tuple[StateDict, StateDict]:
+def _load_adapters(store: ModelStore) -> tuple[StateDict, StateDict]:
     g = store.load_tensors(store.local_global_path)
     p = store.load_tensors(store.personal_adapter_path)
     if g is None or p is None:
@@ -153,22 +157,22 @@ def _release_model() -> None:
 
 def heldout_losses(
     spec: ModelSpec,
-    store: ClientStore,
+    store: ModelStore,
     states: tuple[StateDict, StateDict],
     variants: Sequence[str],
     seed: int,
 ) -> dict[str, float]:
     from fedlora_music.adapters import load_adapter_state, only_adapters
     from fedlora_music.model import get_runtime
-    from fedlora_music.trainer import build_loader, heldout_loss
+    from fedlora_music.trainer import heldout_loss
 
     rt = get_runtime(spec)
     load_adapter_state(rt.model, GLOBAL, states[0])
     load_adapter_state(rt.model, PERSONAL, states[1])
-    loader = build_loader(store.eval_tensor_dir, batch_size=1, shuffle=False)
+    loader = rt.backend.build_loader(store.eval_tensor_dir, batch_size=1, shuffle=False)
     losses = {}
     for variant in variants:
-        with only_adapters(rt.model, VARIANTS[variant]):
+        with only_adapters(rt.model, VARIANTS[variant], root=rt.backend.adapter_root):
             losses[variant] = heldout_loss(rt, loader, seed=seed)
         logger.info("held-out loss %-8s %.5f", variant, losses[variant])
     del rt
@@ -177,9 +181,7 @@ def heldout_losses(
 
 
 def generate_variants(
-    ace_project_root: Path,
-    model_variant: str,
-    adapters: AdapterSpec,
+    backend: ModelBackend,
     states: tuple[StateDict, StateDict],
     variants: Sequence[str],
     prompts: Sequence[str],
@@ -189,48 +191,30 @@ def generate_variants(
     out_dir: Path,
 ) -> dict[str, list[tuple[Path, str]]]:
     """Generate ``samples_per_prompt`` clips per prompt per variant, with shared seeds."""
-    from acestep.handler import AceStepHandler
-    from acestep.inference import GenerationConfig, GenerationParams, generate_music
-
-    dit = AceStepHandler()
-    status, ok = dit.initialize_service(
-        project_root=str(ace_project_root), config_path=model_variant, device="auto"
-    )
-    if not ok:
-        raise RuntimeError(f"ACE-Step init failed: {status}")
-
+    adapters = backend.spec.adapters
+    assert adapters is not None
+    generator = backend.open_generator()
     clips: dict[str, list[tuple[Path, str]]] = {}
-    for variant in variants:
-        if VARIANTS[variant]:
-            adapter_dir = export_fused_adapter(
-                *variant_states(*states, variant), adapters, out_dir / "adapters" / variant
-            )
-            msg = dit.load_lora(str(adapter_dir))
-            if not msg.startswith("✅"):
-                raise RuntimeError(f"adapter load failed for {variant}: {msg}")
-        clips[variant] = []
-        for i, prompt in enumerate(prompts):
-            seeds = [seed + i * samples_per_prompt + j for j in range(samples_per_prompt)]
-            result = generate_music(
-                dit,
-                None,
-                GenerationParams(
-                    caption=prompt, lyrics="[Instrumental]", duration=duration, thinking=False
-                ),
-                GenerationConfig(
-                    batch_size=samples_per_prompt,
-                    use_random_seed=False,
-                    seeds=seeds,
-                    audio_format="flac",
-                ),
-                save_dir=str(out_dir / "audio" / variant),
-            )
-            if not result.success:
-                raise RuntimeError(f"generation failed for {variant}: {result.error}")
-            clips[variant].extend((Path(a["path"]), prompt) for a in result.audios)
-        logger.info("generated %d clips for %s", len(clips[variant]), variant)
-        if VARIANTS[variant]:
-            dit.unload_lora()
+    try:
+        for variant in variants:
+            adapter_dir = None
+            if VARIANTS[variant]:
+                adapter_dir = export_fused_adapter(
+                    *variant_states(*states, variant),
+                    adapters,
+                    out_dir / "adapters" / variant,
+                    root=backend.adapter_root,
+                )
+            clips[variant] = []
+            for i, prompt in enumerate(prompts):
+                seeds = [seed + i * samples_per_prompt + j for j in range(samples_per_prompt)]
+                paths = generator.generate(
+                    adapter_dir, prompt, seeds, duration, out_dir / "audio" / variant
+                )
+                clips[variant].extend((p, prompt) for p in paths)
+            logger.info("generated %d clips for %s", len(clips[variant]), variant)
+    finally:
+        generator.close()
     return clips
 
 
@@ -239,9 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--client-dir", type=Path, required=True)
-    ap.add_argument("--ace-project-root", type=Path, required=True)
+    add_model_args(ap)
     ap.add_argument("--app-dir", type=Path, default=Path("."), help="Folder with pyproject.toml")
-    ap.add_argument("--model-variant", default=None, help="Defaults to the run config's")
     ap.add_argument(
         "--reference-audio",
         type=Path,
@@ -273,16 +256,13 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         ap.error(f"unknown variants {sorted(unknown)}; choose from {list(VARIANTS)}")
 
-    store = ClientStore(args.client_dir.expanduser().resolve())
+    client = ClientStore(args.client_dir.expanduser().resolve())
     cfg = load_app_config(args.app_dir.expanduser().resolve())
-    ace_root = args.ace_project_root.expanduser().resolve()
-    spec = ModelSpec(
-        ace_project_root=ace_root,
-        model_variant=args.model_variant or cfg.model.model_variant,
-        adapters=cfg.model.adapters,
-    )
+    spec = model_spec(args, run=cfg.model)
+    backend = get_backend(spec)
+    store = client.model(backend.key)
     states = _load_adapters(store)
-    sources = store.load_sources()
+    sources = client.load_sources()
 
     def source(explicit: Path | None, split: str) -> Path | None:
         if explicit is not None:
@@ -296,9 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = (args.out_dir or store.eval_dir / "runs" / time.strftime("%Y%m%d-%H%M%S")).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
-        "client_dir": str(store.root),
+        "client_dir": str(client.root),
         "created": time.time(),
-        "model_variant": spec.model_variant,
+        "model": backend.key,
         "variants": {v: {} for v in variants},
     }
 
@@ -318,9 +298,7 @@ def main(argv: list[str] | None = None) -> int:
 
         prompts = read_prompts(args.prompts, reference_src)
         clips = generate_variants(
-            ace_root,
-            spec.model_variant,
-            spec.adapters,
+            backend,
             states,
             variants,
             prompts,

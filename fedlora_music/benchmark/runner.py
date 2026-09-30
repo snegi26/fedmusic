@@ -11,7 +11,7 @@ Stages, each resumable (finished work is skipped):
                 gap, prompt adherence, diversity and copy rate, next to the ε each
                 client spent.
 
-    fedlora-benchmark --bench-dir ../fedlora-bench --ace-project-root ../ACE-Step-1.5 \\
+    fedlora-benchmark --bench-dir ../fedlora-bench --model-root ../ACE-Step-1.5 \\
         --sigmas 1,2,4,8 --rounds 10
 
 The personalization gap needs every client's held-out songs in one place, so it
@@ -33,6 +33,9 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 
+from fedlora_music.backends import backend_class
+from fedlora_music.cli import add_model_args, model_spec
+from fedlora_music.config import ModelSpec
 from fedlora_music.evaluate import VARIANTS, load_app_config
 from fedlora_music.metrics import kernel_distance, personalization
 from fedlora_music.privacy import epsilon_after
@@ -69,19 +72,19 @@ def to_toml(values: Mapping[str, str | int | float | bool]) -> str:
 
 def run_config(
     *,
-    ace_project_root: Path,
+    model: ModelSpec,
     clients_root: Path,
     server_output_dir: Path,
     num_clients: int,
     rounds: int,
     sigma: float,
     delta: float,
-    model_variant: str | None,
 ) -> dict[str, str | int | float | bool]:
     """Run-config overrides for one sweep point. Paths are absolute: the simulation
     runs from its own working directory."""
     cfg: dict[str, str | int | float | bool] = {
-        "ace-project-root": str(ace_project_root),
+        "model-backend": model.backend,
+        "model-variant": model.variant,
         "clients-root": str(clients_root),
         "server-output-dir": str(server_output_dir),
         "num-server-rounds": rounds,
@@ -92,8 +95,8 @@ def run_config(
         # The sweep reports ε; it must not stop early because of the default budget.
         "dp-epsilon-budget": math.ceil(epsilon_after(rounds, sigma, delta)) + 1.0,
     }
-    if model_variant:
-        cfg["model-variant"] = model_variant
+    if model.root is not None:
+        cfg["model-root"] = str(model.root)
     return cfg
 
 
@@ -115,7 +118,8 @@ def _has_tensors(path: Path) -> bool:
 
 def stage_prepare(args: argparse.Namespace, clients: Sequence[str]) -> None:
     for name in clients:
-        data, store = args.bench_dir / name, ClientStore(args.bench_dir / "prepared" / name)
+        client = ClientStore(args.bench_dir / "prepared" / name)
+        data, store = args.bench_dir / name, client.model(args.model_key)
         for split, out in (("train", store.tensor_dir), ("eval", store.eval_tensor_dir)):
             if _has_tensors(out):
                 logger.info("%s/%s already prepared", name, split)
@@ -127,26 +131,21 @@ def stage_prepare(args: argparse.Namespace, clients: Sequence[str]) -> None:
                 "--dataset-json",
                 str(data / f"{split}.json"),
                 "--client-dir",
-                str(store.root),
-                "--ace-project-root",
-                str(args.ace_project_root),
+                str(client.root),
+                *args.model_flags,
                 "--split",
                 split,
             ]
-            if args.model_variant:
-                cmd += ["--model-variant", args.model_variant]
             _run(cmd)
 
 
-def _link_client(prepared: ClientStore, fresh: ClientStore) -> None:
+def _link_client(prepared: ClientStore, fresh: ClientStore, key: str) -> None:
     """Fresh state (ledger, personal adapter) per run; tensors are shared read-only."""
-    fresh.eval_dir.mkdir(parents=True, exist_ok=True)
-    for src, dst in (
-        (prepared.tensor_dir, fresh.tensor_dir),
-        (prepared.eval_tensor_dir, fresh.eval_tensor_dir),
-    ):
-        if not dst.exists():
-            dst.symlink_to(src.resolve(), target_is_directory=True)
+    src, dst = prepared.model(key), fresh.model(key)
+    dst.eval_dir.mkdir(parents=True, exist_ok=True)
+    for a, b in ((src.tensor_dir, dst.tensor_dir), (src.eval_tensor_dir, dst.eval_tensor_dir)):
+        if not b.exists():
+            b.symlink_to(a.resolve(), target_is_directory=True)
     if prepared.sources_path.is_file():
         shutil.copy2(prepared.sources_path, fresh.sources_path)
 
@@ -162,19 +161,19 @@ def stage_train(args: argparse.Namespace, clients: Sequence[str], delta: float) 
             _link_client(
                 ClientStore(args.bench_dir / "prepared" / name),
                 ClientStore(run_dir / "clients" / name),
+                args.model_key,
             )
         cfg_path = run_dir / "run_config.toml"
         cfg_path.write_text(
             to_toml(
                 run_config(
-                    ace_project_root=args.ace_project_root,
+                    model=args.spec,
                     clients_root=run_dir / "clients",
                     server_output_dir=server_out,
                     num_clients=len(clients),
                     rounds=args.rounds,
                     sigma=sigma,
                     delta=delta,
-                    model_variant=args.model_variant,
                 )
             ),
             encoding="utf-8",
@@ -214,8 +213,7 @@ def stage_eval(args: argparse.Namespace, clients: Sequence[str]) -> None:
                     "fedlora_music.evaluate",
                     "--client-dir",
                     str(run_dir / "clients" / name),
-                    "--ace-project-root",
-                    str(args.ace_project_root),
+                    *args.model_flags,
                     "--app-dir",
                     str(args.app_dir),
                     "--reference-audio",
@@ -230,7 +228,6 @@ def stage_eval(args: argparse.Namespace, clients: Sequence[str]) -> None:
                     str(args.duration),
                     "--out-dir",
                     str(out_dir),
-                    *(["--model-variant", args.model_variant] if args.model_variant else []),
                 ]
             )
 
@@ -353,12 +350,11 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--bench-dir", type=Path, required=True, help="fedlora-fma-partition output")
-    ap.add_argument("--ace-project-root", type=Path, required=True)
+    add_model_args(ap)
     ap.add_argument("--app-dir", type=Path, default=Path("."), help="Folder with pyproject.toml")
     ap.add_argument("--connection", default="fedlora-sim", help="SuperLink connection name")
     ap.add_argument("--sigmas", default="1,2,4,8", help="Noise multipliers to sweep")
     ap.add_argument("--rounds", type=int, default=10)
-    ap.add_argument("--model-variant", default=None)
     ap.add_argument("--variants", default=",".join(VARIANTS))
     ap.add_argument("--samples-per-prompt", type=int, default=1)
     ap.add_argument("--duration", type=float, default=30.0)
@@ -369,7 +365,6 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     args.bench_dir = args.bench_dir.expanduser().resolve()
-    args.ace_project_root = args.ace_project_root.expanduser().resolve()
     args.app_dir = args.app_dir.expanduser().resolve()
     args.sigmas = [float(s) for s in args.sigmas.split(",") if s.strip()]
     args.variants = [v.strip() for v in args.variants.split(",") if v.strip()]
@@ -380,7 +375,15 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--bench-dir must be outside --app-dir, or `flwr run` would bundle the audio")
 
     clients = client_names(args.bench_dir)
-    delta = load_app_config(args.app_dir).privacy.delta
+    cfg = load_app_config(args.app_dir)
+    delta = cfg.privacy.delta
+    args.spec = model_spec(args, run=cfg.model)
+    args.model_key = backend_class(args.spec.backend)(args.spec).key
+    args.model_flags = [
+        "--model-backend", args.spec.backend,
+        "--model-variant", args.spec.variant,
+        *(["--model-root", str(args.spec.root)] if args.spec.root else []),
+    ]  # fmt: skip
     if "prepare" in stages:
         stage_prepare(args, clients)
     if "train" in stages:
